@@ -11,6 +11,7 @@ import datetime as dt
 from scipy import interpolate
 from subprocess import call, DEVNULL
 from shutil import rmtree, copytree  # rmtree for removing folders
+from resdata.summary import Summary
 
 
 # Internal imports
@@ -336,17 +337,14 @@ class eclipse:
                       dt.datetime.now().strftime("%m-%d-%Y_%H-%M-%S"))
 
     def extract_data(self, member):
-        # get the formated data
-        for prim_ind in self.l_prim:
-            # Loop over all keys in pred_data (all data types)
-            for key in self.all_data_types:
-                if self.pred_data[prim_ind][key] is not None:  # Obs. data at assim. step
-                    true_data_info = [self.true_prim[0], self.true_prim[1][prim_ind]]
-                    try:
-                        data_array = self.get_sim_results(key, true_data_info, member)
-                        self.pred_data[prim_ind][key] = data_array
-                    except:
-                        pass
+        # Generate dataframe
+        case = Summary('En_' + str(member) + os.sep + self.file)
+        all_ecl_data = case.pandas_frame(time_index=self.true_prim[1]) # This will interpolate is report is missing, or is slighly off.
+        # reformat to PIPT structure. Note that some data might not be present in all_data. E.g. seismic data
+        # Convert DataFrame rows to list of dictionaries
+        for i, (_, row) in enumerate(all_ecl_data.iterrows()):
+            record = {key: row[key] if key in all_ecl_data.columns else None for key in self.all_data_types}
+            self.pred_data[i] = record
 
     def coarsen(self, folder, ensembleMember=None):
         """
@@ -823,6 +821,12 @@ class eclipse:
         """
         # Check that we have no trailing spaces
         whichResponse = whichResponse.strip()
+        case = Summary('En_' + str(member) + os.sep + self.file)
+
+        # Extract all data as df and dump
+        return case.pandas_frame()
+
+
 
         # if ensemble DA method
         if member is not None:

@@ -12,6 +12,10 @@ from copy import deepcopy
 from sklearn.cluster import KMeans
 from sklearn.preprocessing import StandardScaler
 
+from resdata.summary import Summary
+from resdata.resfile import ResdataRestartFile,ResdataInitFile
+from resdata.grid import Grid
+
 
 class flow_sim2seis(flow):
     """
@@ -104,13 +108,14 @@ class flow_sim2seis(flow):
                 'En_' + str(self.ensemble_member) + os.sep + self.file + '.DATA')
             grid = self.ecl_case.grid()
 
+            case_name = 'En_' + str(self.ensemble_member) + os.sep + self.file
+            restart = ResdataRestartFile(Grid(case_name), f"{case_name}.UNRST")
+            vintages = restart.report_dates
+
             phases = self.ecl_case.init.phases
             if 'OIL' in phases and 'WAT' in phases and 'GAS' in phases:  # This should be extended
-                vintage = []
                 # loop over seismic vintages
-                for v, assim_time in enumerate(self.pem_input['vintage']):
-                    time = dt.datetime(self.startDate['year'], self.startDate['month'], self.startDate['day']) + \
-                        dt.timedelta(days=assim_time)
+                for v, time in enumerate(vintages):
                     pem_input = {}
                     # get active porosity
                     tmp = self.ecl_case.cell_data('PORO')
@@ -132,16 +137,20 @@ class flow_sim2seis(flow):
                         tmp = self.ecl_case.cell_data('NTG')
                         pem_input['NTG'] = np.array(tmp[~tmp.mask], dtype=float)
 
-                    for var in ['SWAT', 'SGAS', 'PRESSURE', 'RS']:
-                        tmp = self.ecl_case.cell_data(var, time)
-                        # only active, and conv. to float
-                        pem_input[var] = np.array(tmp[~tmp.mask], dtype=float)
+                    pem_input['PRESSURE'] = restart.restart_get_kw('PRESSURE',time).numpy_copy()*0.1 # Bar to MPa
+                    for var in ['PRESSURE','SWAT', 'SGAS', 'RS']:
+                        try:
+                            tmp = restart.restart_get_kw(var,time).numpy_copy()
+                            # only active, and conv. to float
+                            pem_input[var] = np.array(tmp[~tmp.mask], dtype=float)
+                        except:
+                            pem_input[var] = np.zeros_like(pem_input['PRESSURE'], dtype=float) # This is always here.
 
                     if 'press_conv' in self.pem_input:
                         pem_input['PRESSURE'] = pem_input['PRESSURE'] * \
                             self.pem_input['press_conv']
 
-                    tmp = self.ecl_case.cell_data('PRESSURE', 1)
+                    tmp = restart.restart_get_kw('PRESSURE',vintages[0]).numpy_copy()*0.1 # Bar to MPa
                     if hasattr(self.pem, 'p_init'):
                         P_init = self.pem.p_init*np.ones(tmp.shape)[~tmp.mask]
                     else:
@@ -251,7 +260,7 @@ class flow_rock(flow):
                 if elem[0] == 'percentile':  # use for scaling
                     self.pem_input['percentile'] = elem[1]
 
-            pem = getattr(import_module('simulator.rockphysics.' +
+            pem = getattr(import_module('subsurface.rockphysics.' +
                           self.pem_input['model'].split()[0]), self.pem_input['model'].split()[1])
 
             self.pem = pem(self.pem_input)
@@ -275,78 +284,87 @@ class flow_rock(flow):
         success = super().call_sim(folder, wait_for_proc)
 
         if success:
+            case_name = 'En_' + str(self.ensemble_member) + os.sep + self.file
+            restart = ResdataRestartFile(Grid(case_name), f"{case_name}.UNRST")
+            data_vintages = restart.report_dates
+
+            self.pem_input['vintage'] = data_vintages[1:] #hardcode this
+
             self.ecl_case = ecl.EclipseCase(
                 'En_' + str(self.ensemble_member) + os.sep + self.file + '.DATA')
-            phases = self.ecl_case.init.phases
-            #if 'OIL' in phases and 'WAT' in phases and 'GAS' in phases:  # This should be extended
-            if 'WAT' in phases and 'GAS' in phases:
-                vintage = []
-                # loop over seismic vintages
-                for v, assim_time in enumerate(self.pem_input['vintage']):
-                    time = dt.datetime(self.startDate['year'], self.startDate['month'], self.startDate['day']) + \
-                        dt.timedelta(days=assim_time)
-                    pem_input = {}
-                    # get active porosity
-                    tmp = self.ecl_case.cell_data('PORO')
-                    if 'compaction' in self.pem_input:
-                        multfactor = self.ecl_case.cell_data('PORV_RC', time)
 
-                        pem_input['PORO'] = np.array(
-                            multfactor[~tmp.mask]*tmp[~tmp.mask], dtype=float)
-                    else:
-                        pem_input['PORO'] = np.array(tmp[~tmp.mask], dtype=float)
-                    # get active NTG if needed
-                    if 'ntg' in self.pem_input:
-                        if self.pem_input['ntg'] == 'no':
-                            pem_input['NTG'] = None
-                        else:
-                            tmp = self.ecl_case.cell_data('NTG')
-                            pem_input['NTG'] = np.array(tmp[~tmp.mask], dtype=float)
+            #phases = self.ecl_case.init.phases
+            phases = ['OIL','WAT','GAS'] #self.ecl_case.init.phases
+            #if 'OIL' in phases and 'WAT' in phases and 'GAS' in phases:  # This should be extended
+            #if 'WAT' in phases and 'GAS' in phases:
+            vintage = []
+            # loop over seismic vintages
+            for v, time in enumerate(data_vintages[1:]):
+                pem_input = {}
+                # get active porosity
+                tmp = self.ecl_case.cell_data('PORO')
+                if 'compaction' in self.pem_input:
+                    multfactor = self.ecl_case.cell_data('PORV_RC', time)
+
+                    pem_input['PORO'] = np.array(
+                        multfactor[~tmp.mask]*tmp[~tmp.mask], dtype=float)
+                else:
+                    pem_input['PORO'] = np.array(tmp[~tmp.mask], dtype=float)
+                # get active NTG if needed
+                if 'ntg' in self.pem_input:
+                    if self.pem_input['ntg'] == 'no':
+                        pem_input['NTG'] = None
                     else:
                         tmp = self.ecl_case.cell_data('NTG')
                         pem_input['NTG'] = np.array(tmp[~tmp.mask], dtype=float)
+                else:
+                    tmp = self.ecl_case.cell_data('NTG')
+                    pem_input['NTG'] = np.array(tmp[~tmp.mask], dtype=float)
 
-                    pem_input['RS'] = None
-                    for var in ['SWAT', 'SGAS', 'PRESSURE', 'RS']:
-                        try:
-                            tmp = self.ecl_case.cell_data(var, time)
-                        except:
-                            pass
-                        # only active, and conv. to float
-                        pem_input[var] = np.array(tmp[~tmp.mask], dtype=float)
+                pem_input['RS'] = None
+                pem_input['PRESSURE'] = restart.restart_get_kw('PRESSURE', time).numpy_copy() * 0.1  # Bar to MPa
 
-                    if 'press_conv' in self.pem_input:
-                        pem_input['PRESSURE'] = pem_input['PRESSURE'] * \
-                            self.pem_input['press_conv']
+                for var in ['SWAT', 'SGAS', 'RS']:
+                    try:
+                        tmp = restart.restart_get_kw(var,time).numpy_copy()
+                    except:
+                        tmp = np.zeros_like(pem_input['PRESSURE'], dtype=float)
+                    # only active, and conv. to float
+                    pem_input[var] = tmp
 
-                    tmp = self.ecl_case.cell_data('PRESSURE', 1)
-                    if hasattr(self.pem, 'p_init'):
-                        P_init = self.pem.p_init*np.ones(tmp.shape)[~tmp.mask]
-                    else:
-                        # initial pressure is first
-                        P_init = np.array(tmp[~tmp.mask], dtype=float)
+                if 'press_conv' in self.pem_input:
+                    pem_input['PRESSURE'] = pem_input['PRESSURE'] * \
+                        self.pem_input['press_conv']
 
-                    if 'press_conv' in self.pem_input:
-                        P_init = P_init*self.pem_input['press_conv']
+                tmp = restart.restart_get_kw('PRESSURE', data_vintages[0]).numpy_copy()*0.1 # Bar to MPa
+                if hasattr(self.pem, 'p_init'):
+                    P_init = self.pem.p_init*np.ones(tmp.shape)[~tmp.mask]
+                else:
+                    # initial pressure is first
+                    P_init = tmp
 
-                    saturations = [1 - (pem_input['SWAT'] + pem_input['SGAS']) if ph == 'OIL' else pem_input['S{}'.format(ph)]
-                                   for ph in phases]
-                    # Get the pressure
-                    self.pem.calc_props(phases, saturations, pem_input['PRESSURE'], pem_input['PORO'],
-                                        ntg=pem_input['NTG'], Rs=pem_input['RS'], press_init=P_init,
-                                        ensembleMember=self.ensemble_member)
-                    # mask the bulkimp to get proper dimensions
-                    tmp_value = np.zeros(self.ecl_case.init.shape)
-                    tmp_value[self.ecl_case.init.actnum] = self.pem.bulkimp
-                    self.pem.bulkimp = np.ma.array(data=tmp_value, dtype=float,
-                                                   mask=deepcopy(self.ecl_case.init.mask))
-                    # run filter
-                    self.pem._filter()
-                    vintage.append(deepcopy(self.pem.bulkimp))
+                if 'press_conv' in self.pem_input:
+                    P_init = P_init*self.pem_input['press_conv']
+
+                saturations = [1 - (pem_input['SWAT'] + pem_input['SGAS']) if ph == 'OIL' else pem_input['S{}'.format(ph)]
+                               for ph in phases]
+                # Get the pressure
+                self.pem.calc_props(phases, saturations, pem_input['PRESSURE'], pem_input['PORO'],
+                                    ntg=pem_input['NTG'], Rs=pem_input['RS'], press_init=P_init,
+                                    ensembleMember=self.ensemble_member)
+                # mask the bulkimp to get proper dimensions
+                tmp_value = np.zeros(self.ecl_case.init.shape)
+                tmp_value[self.ecl_case.init.actnum] = self.pem.bulkimp
+                self.pem.bulkimp = np.ma.array(data=tmp_value, dtype=float,
+                                               mask=deepcopy(self.ecl_case.init.mask))
+                # run filter
+                self.pem._filter()
+                vintage.append(deepcopy(self.pem.bulkimp))
 
             if hasattr(self.pem, 'baseline'):  # 4D measurement
-                base_time = dt.datetime(self.startDate['year'], self.startDate['month'],
-                                        self.startDate['day']) + dt.timedelta(days=self.pem.baseline)
+                base_time = data_vintages[int(self.pem.baseline)]
+                #base_time = dt.datetime(self.startDate['year'], self.startDate['month'],
+                #                        self.startDate['day']) + dt.timedelta(days=self.pem.baseline)
                 # pem_input = {}
                 # get active porosity
                 tmp = self.ecl_case.cell_data('PORO')
@@ -360,13 +378,14 @@ class flow_rock(flow):
                     pem_input['PORO'] = np.array(tmp[~tmp.mask], dtype=float)
 
                 pem_input['RS'] = None
-                for var in ['SWAT', 'SGAS', 'PRESSURE', 'RS']:
+                pem_input['PRESSURE'] = restart.restart_get_kw('PRESSURE',base_time).numpy_copy()*0.1 # Bar to MPa
+                for var in ['SWAT', 'SGAS', 'RS']:
                     try:
                         tmp = self.ecl_case.cell_data(var, base_time)
                     except:
-                        pass
+                        tmp = np.zeros_like(pem_input['PRESSURE'])
                     # only active, and conv. to float
-                    pem_input[var] = np.array(tmp[~tmp.mask], dtype=float)
+                    pem_input[var] = tmp
 
                 if 'press_conv' in self.pem_input:
                     pem_input['PRESSURE'] = pem_input['PRESSURE'] * \
