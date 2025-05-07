@@ -268,8 +268,9 @@ class flow_rock(flow):
         else:
             self.pem = None
 
-    def setup_fwd_run(self, redund_sim):
-        super().setup_fwd_run(redund_sim=redund_sim)
+    def setup_fwd_run(self, **kwargs):
+        self.__dict__.update(kwargs)  # parse kwargs input into class attributes
+        super().setup_fwd_run()
 
     def run_fwd_sim(self, state, member_i, del_folder=True):
         # The inherited simulator also has a run_fwd_sim. Call this.
