@@ -339,7 +339,11 @@ class eclipse:
     def extract_data(self, member):
         # Generate dataframe
         case = Summary('En_' + str(member) + os.sep + self.file)
-        all_ecl_data = case.pandas_frame(time_index=self.true_prim[1]) # This will interpolate is report is missing, or is slighly off.
+        if self.true_prim[0] == 'days':
+            dt_times = [case.start_time + dt.timedelta(days=el) for el in self.true_prim[1]]
+            all_ecl_data = case.pandas_frame(time_index=dt_times)  # Get all
+        else:
+            all_ecl_data = case.pandas_frame(time_index=self.true_prim[1]) # This will interpolate is report is missing, or is slighly off.
         # reformat to PIPT structure. Note that some data might not be present in all_data. E.g. seismic data
         # Convert DataFrame rows to list of dictionaries
         for i, (_, row) in enumerate(all_ecl_data.iterrows()):
