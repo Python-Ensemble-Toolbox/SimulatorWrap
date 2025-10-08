@@ -342,3 +342,27 @@ class ebos(eclipse):
         #                     member = finished_member
 
         return finished_member
+
+if __name__ == "__main__":
+    import sys
+    if len(sys.argv) != 4:
+        print("Usage: python -m simulator.opm <folder> <filename> <mpi>")
+        sys.exit(1)
+
+    folder = sys.argv[1]
+    filename = sys.argv[2]
+    mpi = sys.argv[3]
+    options = {}
+    options['sim_path'] = ''
+    options['sim_flag'] = ''
+    options['mpi'] = mpi
+    options['parsing-strictness'] = ''
+    options['filename'] = filename
+    
+    sim = flow(input_file=options,initialize_parent=False)
+    success = sim.call_sim(folder=folder)
+    if success:
+        sys.exit(0)
+    else:
+        sys.exit(1) # ensure that slurm catch the error
+    #print("Success!" if success else "Failed.")
