@@ -12,7 +12,7 @@ description = "A python package containing some usefull simulator wrappers."
 readme = "README.md"
 requires-python = ">=3.8"
 license = {file = "LICENSE"}
-dependencies = ["numpy", "scipy","mako","mat73","scikit-learn"
+dependencies = ["numpy", "scipy","mako","mat73","scikit-learn","open_petro_elastic","resdata"
   ]
 
 [project.urls]
