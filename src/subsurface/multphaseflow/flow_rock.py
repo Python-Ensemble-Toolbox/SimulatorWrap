@@ -791,11 +791,12 @@ class flow_equinor_sim2seis(flow):
         times_to_collect = self._target_times.copy()
         if self._baseline_time is not None and self._baseline_time not in times_to_collect:
             times_to_collect.append(self._baseline_time)
-
+        
+        baseline_grid = Grid(case_name + '.EGRID')
         df = self._collect_eclipse_frame_optimized(restart, report_dates, times_to_collect)
         self._pem_dataframe = df
         self._pem_results = self._run_pem_dataframe_optimized(
-            df, self._target_times, member_folder
+            df, self._target_times, member_folder, baseline_grid
         )
 
         if self.saveinfo is not None:
@@ -1036,11 +1037,15 @@ class flow_equinor_sim2seis(flow):
 
         return df
 
-    def _run_pem_dataframe_optimized(self, dataframe, target_times, member_folder):
+    def _run_pem_dataframe_optimized(self, dataframe, target_times, member_folder,grid):
         """Optimized version that minimizes file I/O and memory allocations.
         Returns 4D differences between target times and baseline time."""
         config_path = self._resolve_config_path()
         results = {}
+
+        # Get mapping from active to global indices
+        active_df = grid.export_index(active_only=True)
+        active_global_indices = active_df.index.to_numpy()
         
         # Pre-extract static frame once
         static_frame = dataframe[self.PROPS_STATIC].copy()
@@ -1056,6 +1061,7 @@ class flow_equinor_sim2seis(flow):
         
         # Calculate properties for each target time and compute 4D differences
         for time in target_times:
+            # Create full-size array with default values for inactive cells
             token = self._format_date(time)
             
             # Calculate target properties
@@ -1067,10 +1073,27 @@ class flow_equinor_sim2seis(flow):
             if baseline_props is not None:
                 diff_props = {}
                 for prop_name, target_values in target_props.items():
+                    full_array = np.full(grid.get_global_size(), 0.0)  # use 0.0 as default
                     if prop_name in baseline_props:
-                        diff_props[prop_name] = target_values - baseline_props[prop_name]
+                        full_array[active_global_indices] = target_values - baseline_props[prop_name]
+                        # Normalize the full array between 0 and 1
+                        min_val = np.min(full_array)
+                        max_val = np.max(full_array)
+                        if max_val > min_val:
+                            full_array = (full_array - min_val) / (max_val - min_val)
+                        else:
+                            full_array = np.zeros_like(full_array)
+                        diff_props[prop_name] = full_array
                     else:
-                        diff_props[prop_name] = target_values
+                        full_array[active_global_indices] = target_values
+                        # Normalize the full array between 0 and 1
+                        min_val = np.min(full_array)
+                        max_val = np.max(full_array)
+                        if max_val > min_val:
+                            full_array = (full_array - min_val) / (max_val - min_val)
+                        else:
+                            full_array = np.zeros_like(full_array)
+                        diff_props[prop_name] = full_array
                 results[token] = diff_props
             else:
                 # No baseline available, return absolute values
