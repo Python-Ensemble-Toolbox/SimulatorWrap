@@ -1141,6 +1141,8 @@ class flow_equinor_sim2seis(flow):
         vp = saturated.primary_velocity.astype(np.float32, copy=False)
         vs = saturated.secondary_velocity.astype(np.float32, copy=False)
         ai = saturated.acoustic_impedance.astype(np.float32, copy=False)
+        # Replace NaN values with mean of valid numbers
+        ai = np.where(np.isnan(ai), np.nanmean(ai), ai)
         si = saturated.shear_impedance.astype(np.float32, copy=False)
         dens = saturated.density.astype(np.float32, copy=False)
         
