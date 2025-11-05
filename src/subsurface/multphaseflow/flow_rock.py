@@ -1076,13 +1076,14 @@ class flow_equinor_sim2seis(flow):
                     full_array = np.full(grid.get_global_size(), 0.0)  # use 0.0 as default
                     if prop_name in baseline_props:
                         full_array[active_global_indices] = target_values - baseline_props[prop_name]
-                        # Normalize the full array between 0 and 1
-                        min_val = np.min(full_array)
-                        max_val = np.max(full_array)
+                        # scale the full array between -1 and 1
+                        # find max and min for scaling
+                        min_val, max_val = full_array.max(), full_array.min()
                         if max_val > min_val:
-                            full_array = (full_array - min_val) / (max_val - min_val)
-                        else:
                             full_array = np.zeros_like(full_array)
+                        else:
+                            full_array = np.interp(full_array, (min_val, max_val), (-1, 1))
+
                         diff_props[prop_name] = full_array
                     else:
                         full_array[active_global_indices] = target_values
@@ -1090,7 +1091,7 @@ class flow_equinor_sim2seis(flow):
                         min_val = np.min(full_array)
                         max_val = np.max(full_array)
                         if max_val > min_val:
-                            full_array = (full_array - min_val) / (max_val - min_val)
+                            full_array = np.interp(full_array, (min_val, max_val), (-1, 1))
                         else:
                             full_array = np.zeros_like(full_array)
                         diff_props[prop_name] = full_array
