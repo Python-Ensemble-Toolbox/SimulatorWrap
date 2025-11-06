@@ -1078,11 +1078,11 @@ class flow_equinor_sim2seis(flow):
                         full_array[active_global_indices] = target_values - baseline_props[prop_name]
                         # scale the full array between -1 and 1
                         # find max and min for scaling
-                        min_val, max_val = full_array.max(), full_array.min()
+                        min_val, max_val = full_array.min(), full_array.max()
                         if max_val > min_val:
-                            full_array = np.zeros_like(full_array)
-                        else:
                             full_array = np.interp(full_array, (min_val, max_val), (-1, 1))
+                        else:
+                            full_array = np.zeros_like(full_array)
 
                         diff_props[prop_name] = full_array
                     else:
