@@ -1075,7 +1075,7 @@ class flow_equinor_sim2seis(flow):
                 for prop_name, target_values in target_props.items():
                     full_array = np.full(grid.get_global_size(), 0.0)  # use 0.0 as default
                     if prop_name in baseline_props:
-                        full_array[active_global_indices] = target_values - baseline_props[prop_name]
+                        full_array[active_global_indices] = baseline_props[prop_name] - target_values
                         # scale the full array between -1 and 1
                         # find max and min for scaling
                         min_val, max_val = full_array.min(), full_array.max()
