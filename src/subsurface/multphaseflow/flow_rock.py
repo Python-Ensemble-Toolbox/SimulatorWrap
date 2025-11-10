@@ -228,7 +228,7 @@ class flow_rock(flow):
                     self.pem_input['param_file'] = elem[1]
 
 
-            pem = getattr(import_module('simulator.rockphysics.' +
+            pem = getattr(import_module('subsurface.rockphysics.' +
                           self.pem_input['model'].split()[0]), self.pem_input['model'].split()[1])
 
             self.pem = pem(self.pem_input)
@@ -959,8 +959,6 @@ class flow_avo(flow_rock, mixIn_multi_data):
                 kept_data = avo_data_baseline[::step_x, ::step_y, :].copy()
                 avo_data_baseline[:] = np.nan
                 avo_data_baseline[::step_x, ::step_y, :] = kept_data
-		# TODO: check which order to use, 
-		# need to correlate with pipt/toml input-file and compression code
                 avo_baseline = avo_data_baseline.flatten(order="C")
                 avo_baseline = avo_baseline[~np.isnan(avo_baseline)]
                 #rho_baseline = rho_sample
@@ -1002,7 +1000,6 @@ class flow_avo(flow_rock, mixIn_multi_data):
             mask = np.ones(np.shape(avo_data), dtype=bool)
             mask[np.isnan(avo_data)]=False
             np.savez(f'mask_{v}.npz', mask=mask)
-            #TODO: check order of flattening as above
             avo = avo_data.flatten(order="C")
             avo = avo[~np.isnan(avo)]
 
@@ -1397,6 +1394,7 @@ class flow_avo(flow_rock, mixIn_multi_data):
         Rpp = []
         for i in range(len(self.avo_config['angle'])):
             angle = self.avo_config['angle'][i]
+            angle = np.atleast_1d(angle) # avoid error in avo.py
             Rpp = self.pp_func(vp_sample[:, :, :-1], vs_sample[:, :, :-1], rho_sample[:, :, :-1],
                                vp_sample[:, :, 1:], vs_sample[:, :, 1:], rho_sample[:, :, 1:], angle)
 
