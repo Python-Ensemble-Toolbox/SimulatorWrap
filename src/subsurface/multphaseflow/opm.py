@@ -107,7 +107,7 @@ class flow(eclipse):
 
         # Extract mpi flag from kwargs
         mpi = kwargs.get("mpi", None)
-        mpi_str = f'"{mpi}"' if mpi is not None else "mpirun --bind-to none -np 1"
+        mpi_str = f'"{mpi}"' if mpi is not None else '"mpirun --bind-to none -np 1"'
 
         # set number of tasks to the number following -np in mpi_str (default is 1)
         n_tasks = re.search(r"-np (\d+)", mpi_str).group(1)
@@ -140,7 +140,7 @@ source {venv}
 # Set folder based on SLURM_ARRAY_TASK_ID
 folder="En_$(( {n_e[0]} + SLURM_ARRAY_TASK_ID ))/"
                                      
-python -m simulator.opm "$folder" {filename_str} {mpi_str}                                              
+python -m subsurface.multphaseflow.opm "$folder" {filename_str} {mpi_str}                                              
 """
         script_name = "submit_test_parallel_mpi.sh"
         with open(script_name, "w") as f:
@@ -225,7 +225,7 @@ source {venv}
 IDX=$(( {start_idx} + SLURM_ARRAY_TASK_ID ))
 FOLDER="En_$IDX/"
 
-python -m simulator.opm "$FOLDER" {filename} ""
+python -m subsurface.multphaseflow.opm "$FOLDER" {filename} ""
 """
 
         script_name = "submit_array.sh"
@@ -356,7 +356,7 @@ class ebos(eclipse):
 if __name__ == "__main__":
     import sys
     if len(sys.argv) != 4:
-        print("Usage: python -m simulator.opm <folder> <filename> <mpi>")
+        print("Usage: python -m subsurface.multphaseflow.opm <folder> <filename> <mpi>")
         sys.exit(1)
 
     folder = sys.argv[1]
