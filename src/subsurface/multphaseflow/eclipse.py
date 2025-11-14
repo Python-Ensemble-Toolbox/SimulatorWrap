@@ -47,6 +47,7 @@ class eclipse:
                     - sim_path: Path to the simulator
                     - sim_flag: Flags sent to the simulator (see simulator documentation for all possibilities)
                 - sim_limit: maximum number of seconds a simulation can run before being killed
+                - mem_req: estimated memory requirement (Gigabyte) used when running a job on a hpc
                 - runfile: name of the simulation input file
                 - reportpoint: these are the dates the simulator reports results
                 - reporttype: this key states that the report poins are given as dates
@@ -128,6 +129,9 @@ class eclipse:
         if 'sim_limit' in self.input_dict:
             self.options['sim_limit'] = self.input_dict['sim_limit']
 
+        if 'mem_req' in self.input_dict:
+            self.options['mem_req'] = self.input_dict['mem_req']
+            
         if 'reportdates' in self.input_dict:
             self.reportdates = [
                 x * 30 for x in range(1, int(self.input_dict['reportdates'][1]))]

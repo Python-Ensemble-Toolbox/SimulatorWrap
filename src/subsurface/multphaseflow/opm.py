@@ -112,10 +112,12 @@ class flow(eclipse):
         # set number of tasks to the number following -np in mpi_str (default is 1)
         n_tasks = re.search(r"-np (\d+)", mpi_str).group(1)
 
-
         # extract the sim_limit from kwargs. Default is 1 hour
         sim_limit = kwargs.get("sim_limit", None)
         sim_limit_str = f'--time={str(timedelta(seconds=sim_limit))}' if sim_limit is not None else "--time=01:00:00"
+
+        # extract estimated memory requirement (Gigabyte) for a job
+        mem_req = str(kwargs.get("mem_req", 4))
         
         diff_ne = n_e[-1] - n_e[0]
 
@@ -124,7 +126,7 @@ class flow(eclipse):
 #SBATCH --job-name=EnDA                                                                               
 #SBATCH --array=0-{diff_ne}                                                                            
 #SBATCH {sim_limit_str}                                                                                   
-#SBATCH --mem=4G
+#SBATCH --mem={mem_req}G
 #SBATCH --ntasks={n_tasks}                                                                                          
 #SBATCH --cpus-per-task=2                                                                                 
 #SBATCH --export=ALL                                                                                      
