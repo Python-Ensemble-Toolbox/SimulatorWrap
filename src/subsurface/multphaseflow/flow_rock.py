@@ -78,7 +78,7 @@ class mixIn_multi_data():
 
         return water_depths
 
-    def measurement_locations(self, grid, water_depth, pad=1500, dxy=3000, well_coord = None, dxy_fine = 1500, r0 = 5000):
+    def measurement_locations(self, grid, water_depth, pad=1500, dxy=3000, well_coord = None, r0 = 5000):
 
         # Determine the size of the measurement area as defined by the field extent
         cell_centre = self.find_cell_centre(grid)
@@ -106,8 +106,14 @@ class mixIn_multi_data():
         if well_coord is not None:
             # choose center point and radius for area with finer measurement grid
             # y = 64, x = 34  # alpha well position Smeaheia
-            xc = cell_centre[well_coord[0]]
-            yc = cell_centre[well_coord[1]]
+            if isinstance(cell_centre, list):
+                xc = np.unique(cell_centre[0])[well_coord[0]]
+                yc = np.unique(cell_centre[1])[well_coord[1]]
+            else:
+                xc = cell_centre[well_coord[0]]
+                yc = cell_centre[well_coord[1]]
+
+            dxy_fine = round(dxy/2)
 
             # Fine grid covering bounding box of the circle (clamped to domain)
             fx_min = max(x_min, xc - r0)
@@ -152,7 +158,7 @@ class mixIn_multi_data():
         pos = {'x': x.flatten(), 'y': y.flatten()}
 
         # Seabed map or water depth scalar depending on input
-        if isinstance(water_depth, float):
+        if isinstance(water_depth, float) or isinstance(water_depth, int):
             pos['z'] = np.ones_like(pos['x']) * water_depth
         else:
             pos['z'] = griddata((water_depth['x'], water_depth['y']),
@@ -1192,9 +1198,14 @@ class flow_avo(flow_rock, mixIn_multi_data):
                         if item[0] == 'dimension':
                             dimension = item[1]
                             break
-                    self.NX = int(dimension[0])
-                    self.NY = int(dimension[1])
-                    self.NZ = int(dimension[2])
+                    if len(dimension)== 2:
+                        self.NX = int(dimension[0])
+                        self.NY = int(1)
+                        self.NZ = int(dimension[1])
+                    else:
+                        self.NX = int(dimension[0])
+                        self.NY = int(dimension[1])
+                        self.NZ = int(dimension[2])
             #    reader = GRDECL_Parser(filename=file)
             #    reader.read_GRDECL()
             #    exec(f"self.{kw} = reader.{kw}.reshape((reader.NX, reader.NY, reader.NZ), order='F')")
@@ -1745,17 +1756,19 @@ class flow_grav(flow_rock, mixIn_multi_data):
         pad = self.grav_config.get('padding', 1500)  # 3 km padding around the reservoir
         if 'padding' not in self.grav_config:
             print('Please specify extent of measurement locations (Padding in input file), using 1.5 km as default')
-        dxy = self.grav_config.get('grid_spacing', 1500)  #
-        if 'grid_spacing' not in self.grav_config:
-            print('Please specify grid spacing in input file, using 1.5 km as default')
-        if 'seabed' in self.grav_config and self.grav_config['seabed'] is not None:
+        dxy = self.grav_config.get('meas_spacing', 1500)  #
+        if 'meas_spacing' not in self.grav_config:
+            print('Please specify measurement spacing in input file, using 1.5 km as default')
+        if 'seabed' in self.grav_config and isinstance(self.grav_config['seabed'], str) is True:
             file_path = self.grav_config['seabed']
             water_depth = self.get_seabed_depths(file_path)
         else:
             water_depth = self.grav_config.get('water_depth', 300)
             if 'water_depth' not in self.grav_config:
                 print('Please specify water depths in input file, using 300 m as default')
-        pos = self.measurement_locations(grid, water_depth, pad, dxy)
+        well_coord = self.grav_config.get('well_coord', None)
+
+        pos = self.measurement_locations(grid, water_depth, pad, dxy, well_coord)
 
         # loop over vintages with gravity acquisitions
         grav_struct = {}
@@ -2016,7 +2029,7 @@ class flow_grav(flow_rock, mixIn_multi_data):
         GRAV configuration
         """
         # list of configuration parameters in the "Grav" section of teh pipt file
-        config_para_list = ['baseline', 'vintage', 'water_depth', 'padding', 'grid_spacing', 'seabed']
+        config_para_list = ['baseline', 'vintage', 'water_depth', 'padding', 'meas_spacing', 'seabed', 'well_coord']
 
         if 'grav' in self.input_dict:
             self.grav_config = {}
@@ -2094,10 +2107,10 @@ class flow_seafloor_disp(flow_rock, mixIn_multi_data):
         pad = self.disp_config.get('padding', 1500)  # 3 km padding around the reservoir
         if 'padding' not in self.disp_config:
             print('Please specify extent of measurement locations, padding in input file, using 1.5 km as default')
-        dxy = self.disp_config.get('grid_spacing', 1500)  #
-        if 'grid_spacing' not in self.disp_config:
+        dxy = self.disp_config.get('meas_spacing', 1500)  #
+        if 'meas_spacing' not in self.disp_config:
             print('Please specify grid spacing in input file, using 1.5 km as default')
-        if 'seabed' in self.disp_config and self.disp_config['seabed'] is not None:
+        if 'seabed' in self.disp_config and isinstance(self.disp_config['seabed'], str) is True:
             file_path = self.disp_config['seabed']
             water_depth = self.get_seabed_depths(file_path)
         else:
@@ -2571,7 +2584,7 @@ class flow_seafloor_disp(flow_rock, mixIn_multi_data):
         """
         # list of configuration parameters in the "Grav" section of teh pipt file
         config_para_list = ['baseline', 'vintage', 'method', 'model', 'poisson', 'compressibility',
-                            'z_base', 'grid_spacing', 'padding', 'seabed', 'water_depth']
+                            'z_base', 'meas_spacing', 'padding', 'seabed', 'water_depth']
 
         if 'sea_disp' in self.input_dict:
             self.disp_config = {}
@@ -2596,16 +2609,21 @@ class flow_seafloor_disp(flow_rock, mixIn_multi_data):
                         v = self.disp_config['vintage'].index(self.true_prim[1][prim_ind])
                         self.pred_data[prim_ind][key] = self.disp_result[v].flatten()
 
-class flow_grav_and_avo(flow_avo, flow_grav):
+class flow_multi_data(flow_avo, flow_grav, flow_seafloor_disp):
     def __init__(self, input_dict=None, filename=None, options=None, **kwargs):
         super().__init__(input_dict, filename, options)
 
-        self.grav_input = {}
-        assert 'grav' in input_dict, 'To do GRAV simulation, please specify an "GRAV" section in the "FWDSIM" part'
-        self._get_grav_info()
+        if 'grav' in input_dict.get('datatype', []):
+            assert 'grav' in input_dict, 'To do GRAV simulation, please specify an "GRAV" section in the "FWDSIM" part'
+            self._get_grav_info()
 
-        assert 'avo' in input_dict, 'To do AVO simulation, please specify an "AVO" section in the "FWDSIM" part'
-        self._get_avo_info()
+        if 'avo' in input_dict.get('datatype', []):
+            assert 'avo' in input_dict, 'To do AVO simulation, please specify an "AVO" section in the "FWDSIM" part'
+            self._get_avo_info()
+
+        if 'sea_disp' in input_dict.get('datatype', []):
+            assert 'sea_disp' in input_dict, 'To do subsidence/uplift simulation, please specify an "SEA_DISP" section in the "FWDSIM" part'
+            self._get_disp_info()
 
     def setup_fwd_run(self,  **kwargs):
         self.__dict__.update(kwargs)
@@ -2633,82 +2651,15 @@ class flow_grav_and_avo(flow_avo, flow_grav):
 
         # use output from flow simulator to forward model gravity response
         if success:
-            # calculate gravity data based on flow simulation output
-            self.get_grav_result(folder, save_folder)
-            # calculate avo data based on flow simulation output
-            self.get_avo_result(folder, save_folder)
-
-        return success
-
-
-    def extract_data(self, member):
-        # start by getting the data from the flow simulator i.e. prod. and inj. data
-        super(flow_rock, self).extract_data(member)
-
-        # get the gravity data from results
-        for prim_ind in self.l_prim:
-            # Loop over all keys in pred_data (all data types)
-            for key in self.all_data_types:
-                if 'grav' in key:
-                    if self.true_prim[1][prim_ind] in self.grav_config['vintage']:
-                        v = self.grav_config['vintage'].index(self.true_prim[1][prim_ind])
-                        self.pred_data[prim_ind][key] = self.grav_result[v].flatten()
-
-                if 'avo' in key:
-                    if self.true_prim[1][prim_ind] in self.pem_input['vintage']:
-                        idx = self.pem_input['vintage'].index(self.true_prim[1][prim_ind])
-                        filename = self.folder + os.sep + key + '_vint' + str(idx) + '.npz' if self.folder[-1] != os.sep \
-                            else self.folder + key + '_vint' + str(idx) + '.npz'
-                        with np.load(filename) as f:
-                            self.pred_data[prim_ind][key] = f[key]
-                        #v = self.pem_input['vintage'].index(self.true_prim[1][prim_ind])
-                        #self.pred_data[prim_ind][key] = self.avo_result[v].flatten()
-
-class flow_grav_seafloor_disp_and_avo(flow_avo, flow_grav, flow_seafloor_disp):
-    def __init__(self, input_dict=None, filename=None, options=None, **kwargs):
-        super().__init__(input_dict, filename, options)
-
-        assert 'grav' in input_dict, 'To do GRAV simulation, please specify an "GRAV" section in the "FWDSIM" part'
-        self._get_grav_info()
-
-        assert 'avo' in input_dict, 'To do AVO simulation, please specify an "AVO" section in the "FWDSIM" part'
-        self._get_avo_info()
-
-        assert 'sea_disp' in input_dict, 'To do subsidence/uplift simulation, please specify an "SEA_DISP" section in the "FWDSIM" part'
-        self._get_disp_info()
-
-    def setup_fwd_run(self,  **kwargs):
-        self.__dict__.update(kwargs)
-
-        super().setup_fwd_run(redund_sim=None)
-
-    def run_fwd_sim(self, state, member_i, del_folder=True):
-        # The inherited simulator also has a run_fwd_sim. Call this.
-        self.ensemble_member = member_i
-        self.pred_data = super().run_fwd_sim(state, member_i, del_folder)
-
-        return self.pred_data
-
-    def call_sim(self, folder=None, wait_for_proc=False, save_folder=None):
-        # the super run_fwd_sim will invoke call_sim. Modify this such that the fluid simulator is run first.
-        # Then, get the pem.
-        if folder is None:
-            folder = self.folder
-        else:
-            self.folder = folder
-
-        # run flow  simulator
-        # success = True
-        success = super(flow_rock, self).call_sim(folder, True)
-
-        # use output from flow simulator to forward model gravity response
-        if success:
-            # calculate gravity data based on flow simulation output
-            self.get_grav_result(folder, save_folder)
-            # calculate avo data based on flow simulation output
-            self.get_avo_result(folder, save_folder)
-            # calculate gravity data based on flow simulation output
-            self.get_displacement_result(folder, save_folder)
+            if 'grav' in self.all_data_types:
+                # calculate gravity data based on flow simulation output
+                self.get_grav_result(folder, save_folder)
+            if 'avo' in self.all_data_types:
+                # calculate avo data based on flow simulation output
+                self.get_avo_result(folder, save_folder)
+            if 'sea_disp' in self.all_data_types:
+                # calculate gravity data based on flow simulation output
+                self.get_displacement_result(folder, save_folder)
 
         return success
 
@@ -2732,69 +2683,6 @@ class flow_grav_seafloor_disp_and_avo(flow_avo, flow_grav, flow_seafloor_disp):
                             else self.folder + key + '_vint' + str(idx) + '.npz'
                         with np.load(filename) as f:
                             self.pred_data[prim_ind][key] = f[key]
-
-                if 'sea_disp' in key:
-                    if self.true_prim[1][prim_ind] in self.disp_config['vintage']:
-                        v = self.disp_config['vintage'].index(self.true_prim[1][prim_ind])
-                        self.pred_data[prim_ind][key] = self.disp_result[v].flatten()
-
-class flow_grav_seafloor_disp(flow_grav, flow_seafloor_disp):
-    def __init__(self, input_dict=None, filename=None, options=None, **kwargs):
-        super().__init__(input_dict, filename, options)
-
-        assert 'grav' in input_dict, 'To do GRAV simulation, please specify an "GRAV" section in the "FWDSIM" part'
-        self._get_grav_info()
-
-        assert 'sea_disp' in input_dict, 'To do subsidence/uplift simulation, please specify an "SEA_DISP" section in the "FWDSIM" part'
-        self._get_disp_info()
-
-    def setup_fwd_run(self,  **kwargs):
-        self.__dict__.update(kwargs)
-
-        super().setup_fwd_run(redund_sim=None)
-
-    def run_fwd_sim(self, state, member_i, del_folder=True):
-        # The inherited simulator also has a run_fwd_sim. Call this.
-        self.ensemble_member = member_i
-        self.pred_data = super().run_fwd_sim(state, member_i, del_folder)
-
-        return self.pred_data
-
-    def call_sim(self, folder=None, wait_for_proc=False, save_folder=None):
-        # the super run_fwd_sim will invoke call_sim. Modify this such that the fluid simulator is run first.
-        # Then, get the pem.
-        if folder is None:
-            folder = self.folder
-        else:
-            self.folder = folder
-
-        # run flow  simulator
-        # success = True
-        success = super(flow_rock, self).call_sim(folder, True)
-
-        # use output from flow simulator to forward model gravity response
-        if success:
-            # calculate gravity data based on flow simulation output
-            self.get_grav_result(folder, save_folder)
-            # calculate avo data based on flow simulation output
-            #self.get_avo_result(folder, save_folder)
-            # calculate gravity data based on flow simulation output
-            self.get_displacement_result(folder, save_folder)
-
-        return success
-
-    def extract_data(self, member):
-        # start by getting the data from the flow simulator i.e. prod. and inj. data
-        super(flow_rock, self).extract_data(member)
-
-        # get the gravity data from results
-        for prim_ind in self.l_prim:
-            # Loop over all keys in pred_data (all data types)
-            for key in self.all_data_types:
-                if 'grav' in key:
-                    if self.true_prim[1][prim_ind] in self.grav_config['vintage']:
-                        v = self.grav_config['vintage'].index(self.true_prim[1][prim_ind])
-                        self.pred_data[prim_ind][key] = self.grav_result[v].flatten()
 
                 if 'sea_disp' in key:
                     if self.true_prim[1][prim_ind] in self.disp_config['vintage']:
