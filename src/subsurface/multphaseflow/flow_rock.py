@@ -227,7 +227,11 @@ class flow_rock(flow):
                 if elem[0] == 'percentile':  # use for scaling
                     self.pem_input['percentile'] = elem[1]
                 if elem[0] == 'phases':  # get the fluid phases
-                    self.pem_input['phases'] = elem[1]
+                    if isinstance(elem[1], list):
+                        self.pem_input['phases'] = [str.upper(item) for item in elem[1]]
+                    else:
+                        phases = str.upper(elem[1])
+                        self.pem_input['phases'] = phases.split()
                 if elem[0] == 'grid':  # get the model grid
                     self.pem_input['grid'] = elem[1]
                 if elem[0] == 'param_file':  # get model parameters required for pem
@@ -268,9 +272,7 @@ class flow_rock(flow):
         else:
             time_input = time
 
-        # fluid phases written given as input
-        phases = str.upper(self.pem_input['phases'])
-        phases = phases.split()
+        phases = self.pem_input['phases']
 
         pem_input = {}
         tmp_dyn_var = {}
