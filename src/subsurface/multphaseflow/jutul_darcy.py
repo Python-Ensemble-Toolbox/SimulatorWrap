@@ -12,6 +12,7 @@ import shutil
 import os
 
 from mako.template import Template
+from typing import Union
 #────────────────────────────────────────────────────
 
 
@@ -22,12 +23,37 @@ __all__ = ['JutulDarcyWrapper']
 class JutulDarcyWrapper:
 
     def __init__(self, options):
+        '''
+        Wrapper for the JutulDarcy simulator [1].
 
+        Parameters
+        ----------
+        options : dict
+            Configuration options for the wrapper.
+            Keys:
+                - 'makofile' or 'runfile': Path to the makofile.mako or runfile.DATA template.
+                - 'reporttype': Type of report (default: 'days').
+                - 'out_format': Output format ('list', 'dict', 'dataframe'; default: 'list').
+                - 'datatype': List of data types to extract (default: ['FOPT', 'FGPT', 'FWPT', 'FWIT']).
+                - 'parallel': Number of parallel simulations (default: 1).
+                - 'platform': 'Python' or 'Julia' (default: 'Python').
+
+        References
+        ----------
+        [1] Møyner, O. (2025).
+            JutulDarcy.jl – a fully differentiable high-performance reservoir simulator
+            based on automatic differentiation. Computational Geosciences, 29, Article 30.
+            https://doi.org/10.1007/s10596-025-10366-6
+        '''
         # Make makofile an mandatory option
-        if 'makofile' not in options:
-            raise ValueError('Wrapper  requires a makofile option')
-        else:
+        if ('makofile' not in options) and ('runfile' not in options):
+            raise ValueError('Wrapper  requires a makofile (or runfile) option')
+        
+        if 'makofile' in options: 
             self.makofile = options.get('makofile')
+
+        if 'runfile' in options:
+            self.makofile = options.get('runfile').split('.')[0] + '.mako'
 
         # Other variables
         self.reporttype = options.get('reporttype', 'days')
@@ -42,20 +68,25 @@ class JutulDarcyWrapper:
         self.true_order = [self.reporttype, options['reportpoint']]
 
 
-    def run_fwd_sim(self, input: dict, idn: int=0, delete_folder: bool=True) -> dict:
+    def run_fwd_sim(self, input: dict, idn: int=0, delete_folder: bool=True) -> Union[dict|list|pd.DataFrame]:
         '''
         Run forward simulation for given input parameters.
 
         Parameters
         ----------
-        input : dict
+        input: dict
             Input parameters for the simulation.
 
-        idn : int, optional
+        idn: int, optional
             Ensemble member ID, by default 0.
 
-        delete_folder : bool, optional
+        delete_folder: bool, optional
             Whether to delete the simulation folder after running, by default True.
+
+        Returns
+        -------
+            output: Union[dict, list, pd.DataFrame]
+                Simulation output in the specified format.
         '''
 
         # Include ensemble member id in input dict
@@ -132,7 +163,22 @@ class JutulDarcyWrapper:
             f.write(template.render(**input))
 
 
-    def extract_datatypes(self, res: dict, out_format='list') -> dict:
+    def extract_datatypes(self, res: dict, out_format='list') -> Union[dict|list|pd.DataFrame]:
+        '''
+        Extract requested datatypes from simulation results.
+
+        Parameters
+        ----------
+        res : dict
+            Simulation results dictionary.
+        out_format : str, optional
+            Output format ('list[dict]', 'dict', 'dataframe'), by default 'list'.
+        
+        Returns
+        -------
+            Union[dict, list, pd.DataFrame]
+                Extracted data in the specified format.
+        '''
         out = {}
         for orginal_key in self.datatype:
             key = orginal_key.upper()
