@@ -91,38 +91,57 @@ class JutulDarcyWrapper:
         #---------------------------------------------------------------------------------------------------------
         if 'adjoints' in options:
             self.compute_adjoints = True
+
             self.adjoint_info = {}
-    
             for datatype in options['adjoints']:
-
-                # Check that datatype is supported
-                if not datatype in ['mass', 'liquid', 'water', 'oil', 'gas', 'rate']:
-                    raise ValueError(f'Adjoint objective {datatype} not supported')
                 
-                well_id = options['adjoints'][datatype]['well_id']
-                param = options['adjoints'][datatype]['param']
-                unit  = options['adjoints'][datatype]['unit']
-                steps = options['adjoints'][datatype].get('steps', 'all')
+                # Determine if rate or volume and phase. 
+                if datatype in ['WOPT', 'WGPT', 'WWPT', 'WLPT']:
+                    rate  = False
+                    phase = {
+                        'WOPT': 'oil',
+                        'WGPT': 'gas',
+                        'WWPT': 'water',
+                        'WLPT': 'liquid',
+                    }[datatype]
+                
+                elif datatype in ['WOPR', 'WGPR', 'WWPR', 'WLPR']:
+                    rate  = True
+                    phase = {
+                        'WOPR': 'oil',
+                        'WGPR': 'gas',
+                        'WWPR': 'water',
+                        'WLPR': 'liquid',
+                    }[datatype]
 
+
+                # Determine steps
+                steps = options['adjoints'][datatype].get('steps', 'acc')
                 if steps == 'acc':
-                    steps = None
+                    steps = [self.steps[-1]]
+                    accumulative = True
                 elif steps == 'all':
                     steps = self.steps
+                    accumulative = False
                 elif isinstance(steps, int):
+                    accumulative = False
                     steps = [steps]
+                
+                well_ids = options['adjoints'][datatype]['well_id']
+                parameters = options['adjoints'][datatype]['parameters']
 
-                if not isinstance(well_id, list):
-                    well_id = [well_id]
-                if not isinstance(param, list):
-                    param = [param]
+                # Ensure well_ids and parameters are lists
+                well_ids = well_ids if isinstance(well_ids, (list, tuple)) else [well_ids]
+                parameters = parameters if isinstance(parameters, (list, tuple)) else [parameters]
 
-                for wid in well_id:
+                for wid in well_ids:
                     self.adjoint_info[f'{datatype}:{wid}'] = {
-                        'datatype': datatype,
+                        'rate': rate,
+                        'phase': phase,
                         'well_id': wid,
-                        'param': param,
-                        'unit': unit,
-                        'steps': steps
+                        'parameters': parameters,
+                        'steps': steps,
+                        'accumulative': accumulative,
                     }
         #---------------------------------------------------------------------------------------------------------
 
@@ -170,6 +189,9 @@ class JutulDarcyWrapper:
             output: Union[dict, list, pd.DataFrame]
                 Simulation output in the specified format.
         '''
+        from juliacall import Main as jl
+        from jutuldarcy import convert_to_pydict
+        jl.seval("using JutulDarcy, Jutul")
 
         # Include ensemble member id in input dict
         input['member'] = idn
@@ -183,10 +205,6 @@ class JutulDarcyWrapper:
 
         # Enter simulation folder and run simulation
         os.chdir(folder)
-
-        from juliacall import Main as jl
-        from jutuldarcy import convert_to_pydict
-        jl.seval("using JutulDarcy, Jutul")
 
         # Setup case
         case = jl.setup_case_from_data_file(self.datafile)
@@ -204,8 +222,17 @@ class JutulDarcyWrapper:
         pyres = convert_to_pydict(jlres, case, units=self.units)
 
         if self.compute_adjoints:
-            adjoints = {key: {} for key in self.adjoint_info}
 
+            # Initialize adjoint dataframe
+            colnames = []
+            for key in self.adjoint_info:
+                for param in self.adjoint_info[key]['parameters']:
+                    colnames.append((key, param))
+
+            adjoints = pd.DataFrame(columns=pd.MultiIndex.from_tuples(colnames), index=self.true_order[1])
+            adjoints.index.name = self.true_order[0]
+
+            # Initialize progress bar
             pbar = tqdm(
                 adjoints.keys(), 
                 desc=f'Solving adjoints for En_{idn}',
@@ -216,60 +243,63 @@ class JutulDarcyWrapper:
                 **PBAR_OPTS
             )
             
-            for key in adjoints:
-                #datatype, well_id, param, unit = self.adjoint_info[key]
-                info = self.adjoint_info[key]
+            # Loop over adjoint objectives
+            for col in adjoints.columns.levels[0]:
+                info = self.adjoint_info[col]
 
-                if info['unit'] == 'rate':
-                    rate = True
-                elif info['unit'] == 'volume':
-                    rate = False
-                else:
-                    raise ValueError(f'Unknown unit type: {info["unit"]}')
-
-                func = get_well_objective(
-                    info['well_id'], 
-                    info['datatype'], 
-                    info['steps'], 
-                    rate=rate, 
+                funcs = get_well_objective(
+                    well_id=info['well_id'],
+                    rate_id=info['phase'],
+                    step_id=info['steps'],
+                    rate=info['rate'],
+                    accumulative=info['accumulative'],
                     jl_import=jl
                 )
 
                 # Define objective function
-                func = func if isinstance(func, list) else [func]
-                grad = []
-                for f in func:
+                funcs = funcs if isinstance(funcs, list) else [funcs]
+                grads = []
+                for func in funcs:
                     # Compute adjoint gradient
-                    g = jl.JutulDarcy.reservoir_sensitivities(
+                    grad = jl.JutulDarcy.reservoir_sensitivities(
                         case, 
                         jlres, 
-                        f,
+                        func,
                         include_parameters=True,
                     )
-                    grad.append(g)
+                    grads.append(grad)
+
+                # Extract and store gradients in adjoint dataframe
+                for g, grad in enumerate(grads):
+                    for param in info['parameters']:
+                        index = self.true_order[1][info['steps'][g]-1]
+                        
+                        if param.lower() == 'poro':
+                            grad_param = np.array(grad[jl.Symbol("porosity")])
+                            grad_param = _expand_to_active_grid(grad_param, actnum_vec, fill_value=0)
+                            adjoints.at[index, (col, param)] = grad_param
+
+                        elif param.lower().startswith('perm'):
+                            grad_param = np.array(grad[jl.Symbol("permeability")])
+
+                            m2_per_mD = 9.869233e-16
+                            if param.lower() == 'permx':
+                                grad_param = grad_param[0] * m2_per_mD
+                            elif param.lower() == 'permy':
+                                grad_param = grad_param[1] * m2_per_mD
+                            elif param.lower() == 'permz':
+                                grad_param = grad_param[2] * m2_per_mD
+                            
+                            grad_param = _expand_to_active_grid(grad_param, actnum_vec, fill_value=0)
+                            adjoints.at[index, (col, param)] = grad_param
+                        else:
+                            raise ValueError(f'Param: {param} not supported for adjoint sensitivity')
                 
-                # POROSITY
-                if 'poro' in info['param']:
-                    poro_grads = []
-                    for g in grad:
-                        poro_grad = np.array(g[jl.Symbol("porosity")])
-                        poro_grads.append(_expand_to_active_grid(poro_grad, actnum_vec, fill_value=0))
-                    adjoints[key]['poro'] = np.squeeze(np.array(poro_grads))
-
-                # PERMEABILITY
-                m2_per_mD = 9.869233e-16
-                for idx, perm_key in enumerate(['permx', 'permy', 'permz']):
-                    if perm_key in info['param']:
-                        perm_grads = []
-                        for g in grad:
-                            perm_grad = np.array(g[jl.Symbol("permeability")])[idx] * m2_per_mD
-                            perm_grads.append(_expand_to_active_grid(perm_grad, actnum_vec, fill_value=0))
-                        adjoints[key][perm_key] = np.squeeze(np.array(perm_grads))
-
+                
                 # Update progress bar
                 pbar.update(1)
             pbar.close()
-          
+
         os.chdir('..')
 
         # Delete simulation folder
@@ -348,7 +378,6 @@ class JutulDarcyWrapper:
             df = pd.DataFrame(data=out, index=res['DAYS'])
             return df
         
-
     
 def _symdict_to_pydict(symdict, jl_import):
     '''Convert a Julia symbolic dictionary to a Python dictionary recursively.'''
@@ -379,7 +408,7 @@ def _expand_to_active_grid(param, active, fill_value=np.nan):
     return np.array(val)
 
 
-def get_well_objective(well_id, rate_id, step_id, rate=True, jl_import=None):
+def get_well_objective(well_id, rate_id, step_id, rate=True, accumulative=True, jl_import=None):
     '''
     Create a Julia objective function for well-based adjoint sensitivity analysis.
 
@@ -424,13 +453,8 @@ def get_well_objective(well_id, rate_id, step_id, rate=True, jl_import=None):
 
     Examples
     --------
-    >>> # Objective for total oil production across all timesteps
     >>> obj = get_well_objective('PROD1', 'oil', None, rate=False)
-    
-    >>> # Objective for water rate at timestep 10
     >>> obj = get_well_objective('INJ1', 'water', 10, rate=True)
-    
-    >>> # Objectives for gas rate at multiple timesteps
     >>> objs = get_well_objective('PROD2', 'gas', [5, 10, 15], rate=True)
     '''
 
@@ -457,7 +481,7 @@ def get_well_objective(well_id, rate_id, step_id, rate=True, jl_import=None):
 
     # Case 1: Sum of all timesteps
     #-----------------------------------------------------------------------------
-    if step_id is None:
+    if accumulative:
         jl_import.seval(f"""
         function objective_function(model, state, dt, step_i, forces)
             rate = JutulDarcy.compute_well_qoi(
