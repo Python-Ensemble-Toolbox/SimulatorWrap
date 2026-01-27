@@ -85,7 +85,7 @@ class JutulDarcyWrapper:
         # This is for PET to work properly (should be removed in future versions)
         self.input_dict = options
         self.true_order = [self.reporttype, options['reportpoint']]
-        self.steps = [i+1 for i in range(len(self.true_order[1]))]
+        self.steps = [i for i in range(len(self.true_order[1]))]
 
         # Adjoint settings
         #---------------------------------------------------------------------------------------------------------
@@ -272,7 +272,7 @@ class JutulDarcyWrapper:
                 # Extract and store gradients in adjoint dataframe
                 for g, grad in enumerate(grads):
                     for param in info['parameters']:
-                        index = self.true_order[1][info['steps'][g]-1]
+                        index = self.true_order[1][info['steps'][g]]
                         
                         if param.lower() == 'poro':
                             grad_param = np.array(grad[jl.Symbol("porosity")])
@@ -504,7 +504,7 @@ def get_well_objective(well_id, rate_id, step_id, rate=True, accumulative=True, 
         for sid in step_id:
             jl_import.seval(f"""
             function objective_function_{sid}(model, state, dt, step_i, forces)
-                if step_i != {sid}
+                if step_i != {sid+1}
                     return 0.0
                 else
                     rate = JutulDarcy.compute_well_qoi(
@@ -527,7 +527,7 @@ def get_well_objective(well_id, rate_id, step_id, rate=True, accumulative=True, 
     else:
         jl_import.seval(f"""
         function objective_function(model, state, dt, step_i, forces)
-            if step_i != {step_id}
+            if step_i != {step_id+1}
                 return 0.0
             else
                 rate = JutulDarcy.compute_well_qoi(
