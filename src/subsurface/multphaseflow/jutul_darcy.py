@@ -113,6 +113,7 @@ class JutulDarcyWrapper:
         self.datatype   = options.get('datatype', ['FOPT', 'FGPT', 'FWPT', 'FWIT'])
         self.parallel   = options.get('parallel', 1)
         self.units      = options.get('units', 'metric') # Not currently used!
+        self.adj_pbar   = options.get('adjoint_pbar', True)
         self.datafile = None
         self.compute_adjoints = False
 
@@ -388,17 +389,18 @@ class JutulDarcyWrapper:
             attrs = {}
 
             # Initialize progress bar
-            PBAR_OPTS.pop('colour', None)
-            pbar = tqdm(
-                adjoints.keys(), 
-                desc=f'Solving adjoints for En_{idn}',
-                position=idn+1,
-                leave=False,
-                unit='obj',
-                dynamic_ncols=False,
-                colour="#713996",
-                **PBAR_OPTS
-            )
+            if self.adj_pbar:
+                PBAR_OPTS.pop('colour', None)
+                pbar = tqdm(
+                    adjoints.keys(), 
+                    desc=f'Solving adjoints for En_{idn}',
+                    position=idn+1,
+                    leave=False,
+                    unit='obj',
+                    dynamic_ncols=False,
+                    colour="#713996",
+                    **PBAR_OPTS
+                )
             
             # Loop over adjoint objectives
             for col in adjoints.columns.levels[0]:
@@ -488,10 +490,12 @@ class JutulDarcyWrapper:
                         else:
                             raise ValueError(f'Param: {param} not supported for adjoint sensitivity')
                 
-                
                 # Update progress bar
-                pbar.update(1)
-            pbar.close()
+                if self.adj_pbar:
+                    pbar.update(1)
+
+            if self.adj_pbar:
+                pbar.close()
             adjoints.attrs = attrs
 
         os.chdir('..')
