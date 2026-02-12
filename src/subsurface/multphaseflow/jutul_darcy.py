@@ -397,13 +397,13 @@ class JutulDarcyWrapper:
                     position=idn+1,
                     leave=False,
                     unit='obj',
-                    dynamic_ncols=False,
+                    dynamic_ncols=True,
                     colour="#713996",
                     **PBAR_OPTS
                 )
             
             # Loop over adjoint objectives
-            for col in adjoints.columns.levels[0]:
+            for col in self.adjoint_info.keys():
                 info = self.adjoint_info[col]
 
                 funcs = get_well_objective(
@@ -422,7 +422,7 @@ class JutulDarcyWrapper:
                 # Compute adjoints for all functions
                 jl.case = case
                 jl.jlres = jlres
-                for func in funcs:
+                for f, func in enumerate(funcs):
                     jl.func = func
 
                     # Suppress Julia output during adjoint solve
@@ -439,12 +439,21 @@ class JutulDarcyWrapper:
                     end
                     """)
                     grads.append(grad)
-
+                
                 # Extract and store gradients in adjoint dataframe
                 for g, grad in enumerate(grads):
                     for param in info['parameters']:
                         index = self.true_order[1][info['steps'][g]]
                         grad_param, unit = self.extract_grad(grad, param, info, case, actnum_vec, jl)
+                        if 'log' in param.lower():
+                            perm = _extract_grid_property(
+                                case.input_data['GRID'], 
+                                param.split('_')[1].upper(), 
+                                jl
+                            )
+                            grad_param = - grad_param*perm.flatten(order='F')
+                        
+                        # Fill in dataframe and attributes
                         adjoints.at[index, (col, param)] = grad_param
                         attrs[(col, param)] = {'unit': unit}
                 
@@ -513,24 +522,15 @@ class JutulDarcyWrapper:
                 unit = 'Sm3/mD'
 
             # Extract specific permeability component
-            if param.lower() == 'permx':
+            if 'permx' in param.lower():
                 grad_param = grad_param[0]
                 grad_param = _expand_to_active_grid(grad_param, actnum_vec, fill_value=0)
-            elif param.lower() == 'log_permx':
-                permx = _extract_grid_property(case.input_data["GRID"], "PERMX", jl_import=jl)
-                grad_param = grad_param[0] / permx.flatten(order='F')
-            elif param.lower() == 'permy':
+            elif 'permy' in param.lower():
                 grad_param = grad_param[1]
                 grad_param = _expand_to_active_grid(grad_param, actnum_vec, fill_value=0)
-            elif param.lower() == 'log_permy':
-                permy = _extract_grid_property(case.input_data["GRID"], "PERMY", jl_import=jl)
-                grad_param = grad_param[1] / permy.flatten(order='F')
-            elif param.lower() == 'permz':
+            elif 'permz' in param.lower():
                 grad_param = grad_param[2]
                 grad_param = _expand_to_active_grid(grad_param, actnum_vec, fill_value=0)
-            elif param.lower() == 'log_permz':
-                permz = _extract_grid_property(case.input_data["GRID"], "PERMZ", jl_import=jl)
-                grad_param = grad_param[2] / permz.flatten(order='F')
             
             return grad_param, unit
         else:
