@@ -73,8 +73,6 @@ class JutulDarcyWrapper:
                 Default is ['FOPT', 'FGPT', 'FWPT', 'FWIT'].
             - parallel : int, optional
                 Number of parallel simulations to run. Default is 1.
-            - units : {'metric', 'si', 'field'}, optional
-                Unit system for the simulator. Default is 'metric'.
             - adjoints : dict, optional
                 Dictionary specifying adjoint sensitivity configuration. When provided,
                 adjoint calculations are performed. Structure:
@@ -112,7 +110,6 @@ class JutulDarcyWrapper:
         self.out_format = options.get('out_format', 'list')
         self.datatype   = options.get('datatype', ['FOPT', 'FGPT', 'FWPT', 'FWIT'])
         self.parallel   = options.get('parallel', 1)
-        self.units      = options.get('units', 'metric') # Not currently used!
         self.adj_pbar   = options.get('adjoint_pbar', True)
         self.datafile = None
         self.compute_adjoints = False
@@ -443,17 +440,30 @@ class JutulDarcyWrapper:
                 # Extract and store gradients in adjoint dataframe
                 for g, grad in enumerate(grads):
                     for param in info['parameters']:
-                        index = self.true_order[1][info['steps'][g]]
-                        grad_param, unit = self.extract_grad(grad, param, info, case, actnum_vec, jl)
+                        grad_param, unit = self.extract_grad(
+                            grad, 
+                            param.split('_')[1] if 'log' in param.lower() else param,
+                            info,
+                            actnum_vec, 
+                            jl=jl,
+                        )
+
+                        # If parameter is a log-permeability
                         if 'log' in param.lower():
                             perm = _extract_grid_property(
                                 case.input_data['GRID'], 
-                                param.split('_')[1].upper(), 
-                                jl
+                                param.split('_')[1].upper(), # Component of PERM (e.g. PERMX, PERMY, PERMZ)
+                                jl_import=jl
                             )
-                            grad_param = - grad_param*perm.flatten(order='F')
+                            grad_param = grad_param * perm.flatten(order='F')
+                            unit = f'log({unit})'
+
+                        # If col represents production data 
+                        if data_is_prod(col):
+                            grad_param = - grad_param
                         
                         # Fill in dataframe and attributes
+                        index = self.true_order[1][info['steps'][g]]
                         adjoints.at[index, (col, param)] = grad_param
                         attrs[(col, param)] = {'unit': unit}
                 
@@ -477,7 +487,7 @@ class JutulDarcyWrapper:
         else:
             return output
 
-    def extract_grad(self, grad, param, info, case, actnum_vec, jl):
+    def extract_grad(self, grad, param, info, actnum_vec, jl):
         """
         Extract and process gradient for a given parameter.
 
@@ -489,8 +499,6 @@ class JutulDarcyWrapper:
             Parameter name ('poro', 'permx', 'log_permx', 'permy', 'log_permy', 'permz', 'log_permz').
         info : dict
             Adjoint info dictionary containing rate information.
-        case : JutulDarcy.SimulationCase
-            Simulation case object.
         actnum_vec : np.ndarray
             Active cell vector for grid expansion.
         jl : module
@@ -522,15 +530,9 @@ class JutulDarcyWrapper:
                 unit = 'Sm3/mD'
 
             # Extract specific permeability component
-            if 'permx' in param.lower():
-                grad_param = grad_param[0]
-                grad_param = _expand_to_active_grid(grad_param, actnum_vec, fill_value=0)
-            elif 'permy' in param.lower():
-                grad_param = grad_param[1]
-                grad_param = _expand_to_active_grid(grad_param, actnum_vec, fill_value=0)
-            elif 'permz' in param.lower():
-                grad_param = grad_param[2]
-                grad_param = _expand_to_active_grid(grad_param, actnum_vec, fill_value=0)
+            perm_component = {'permx': 0, 'permy': 1, 'permz': 2}[param.lower()]
+            grad_param = grad_param[perm_component]
+            grad_param = _expand_to_active_grid(grad_param, actnum_vec, fill_value=0)
             
             return grad_param, unit
         else:
@@ -636,34 +638,36 @@ class JutulDarcyWrapper:
         for key in datatypes:
             key_upper = key.upper()
 
-            # Check if key is FIELD data
+            indices = []
+            for d, day in enumerate(res['DAYS']):
+                if self.true_order[0] == 'days':
+                    idx = day if day in self.true_order[1] else None
+                else:  # 'date'
+                    idx = start_date + dt.timedelta(days=int(day))
+                    idx = idx if idx in self.true_order[1] else None
+                if idx is not None:
+                    indices.append((d, idx))
+
+            # ----------------------------------------------------------------------------------------------------
+            # FIELD data
+            # ----------------------------------------------------------------------------------------------------
             if key_upper in res['FIELD']:
-                for d, day in enumerate(res['DAYS']):
-                    if self.true_order[0] == 'days':
-                        if day in self.true_order[1]:
-                            df.at[day, key] = res['FIELD'][key_upper][d]
-                    elif self.true_order[0] == 'date':
-                        date = start_date + dt.timedelta(days=int(day))
-                        if date in self.true_order[1]:
-                            df.at[date, key] = res['FIELD'][key_upper][d]
+                for d, idx in indices:
+                    df.at[idx, key] = res['FIELD'][key_upper][d]
                 attrs[key_upper] = {'unit': _metric_unit(key_upper)}
 
-            # Check if key is WELLS data (format: "DATA:WELL" or "DATA WELL")
+            # ----------------------------------------------------------------------------------------------------
+            # WELL data
+            # ----------------------------------------------------------------------------------------------------
             elif ':' in key_upper or ' ' in key_upper:
                 datakey, wid = key_upper.replace(':', ' ').split(' ')
-                for d, day in enumerate(res['DAYS']):
-                    
-                    if self.true_order[0] == 'days':
-                        if day in self.true_order[1]:
-                            df.at[day, key] = res['WELLS'][wid][datakey][d]
-                    elif self.true_order[0] == 'date':
+                for d, idx in indices:
+                    df.at[idx, key] = res['WELLS'][wid][datakey][d]
+                attrs[key_upper] = {'unit': _metric_unit(key_upper)}
 
-                        date = start_date + dt.timedelta(days=int(day))
-                        if date in self.true_order[1]:
-                            df.at[date, key] = res['WELLS'][wid][datakey][d]
-
-                attrs[key_upper] = {'unit': _metric_unit(key.upper())}
-
+            # ----------------------------------------------------------------------------------------------------
+            # GRID property
+            # ----------------------------------------------------------------------------------------------------
             elif key_upper in [str(k) for k in jlcase.input_data["GRID"].keys()] and (jlcase is not None):
                 value = _extract_grid_property(
                     jlcase.input_data["GRID"], 
@@ -684,12 +688,6 @@ class JutulDarcyWrapper:
         df.attrs = attrs
         return df
 
-def _extract_well_data(wdata, datakey, wid, reporttype, reportpoint):
-    pass
-
-def _extract_field_data(fdata, datakey, reporttype, reportpoint):
-    pass
-
 def _extract_grid_property(gdata, prop, jl_import):
     value = gdata[prop]
     if 'perm' in prop.lower():
@@ -699,6 +697,18 @@ def _extract_grid_property(gdata, prop, jl_import):
         try: value = np.array(value)
         except: pass
     return value
+
+def data_is_prod(datakey):
+    map = [
+        'FOPR', 'FGPR', 'FWPR', 'FLPR',
+        'WOPR', 'WGPR', 'WWPR', 'WLPR',
+    ]
+    is_prod = False
+    for m in map:
+        if m in datakey.upper():
+            is_prod = True
+            break
+    return is_prod
     
 
 def _symdict_to_pydict(symdict, jl_import):
