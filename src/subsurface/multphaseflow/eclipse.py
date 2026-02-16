@@ -10,12 +10,17 @@ from multiprocessing import Process
 import datetime as dt
 from scipy import interpolate
 from subprocess import call, DEVNULL
+from misc import ecl, grdecl
 from shutil import rmtree, copytree  # rmtree for removing folders
-
+import time
+# import rips
+from glob import glob
 
 # Internal imports
-from subsurface.multphaseflow.misc import ecl, grdecl
-from subsurface.multphaseflow.misc.system_tools.environ_var import EclipseRunEnvironment
+from misc.system_tools.environ_var import EclipseRunEnvironment
+from pipt.misc_tools.analysis_tools import store_ensemble_sim_information
+from pipt.misc_tools.extract_tools import list_to_dict
+
 
 class eclipse:
     """
@@ -42,10 +47,17 @@ class eclipse:
                     - sim_path: Path to the simulator
                     - sim_flag: Flags sent to the simulator (see simulator documentation for all possibilities)
                 - sim_limit: maximum number of seconds a simulation can run before being killed
+                - mem: estimated memory requirement (Gigabyte) used when running a job on a hpc
+                - python_ver: specify the python version to use when running on a hpc
+                - opm_ver: specify the OPM version to use when running on a hpc
                 - runfile: name of the simulation input file
                 - reportpoint: these are the dates the simulator reports results
                 - reporttype: this key states that the report poins are given as dates
                 - datatype: the data types the simulator reports
+                - replace: replace failed simulations with randomly selected successful ones
+                - rerun: in case of failure, try to rerun the simulator the given number of times
+                - startdate: simulaton start date
+                - saveforecast: save the predicted measurements for each iteration
 
         filename : str, optional
             Name of the .mako file utilized to generate the ECL input .DATA file. Must be in uppercase for the
@@ -74,6 +86,9 @@ class eclipse:
         self.inv_stat = None
         self.static_state = None
 
+        # Multilevel default value
+        self.level = -1
+
     def _extInfoInputDict(self):
         """
         Extract the manditory and optional information from the input_dict dictionary.
@@ -100,27 +115,31 @@ class eclipse:
 
         # In the ecl framework, all reference to the filename should be uppercase
         self.file = self.input_dict['runfile'].upper()
+
+        # Extract sim options
+        simoptions = self.input_dict.get('simoptions', {})
+        if isinstance(simoptions, list):
+            simoptions = list_to_dict(simoptions)
+
         self.options = {}
-        self.options['sim_path'] = ''
-        self.options['sim_flag'] = ''
-        self.options['mpi'] = ''
-        self.options['parsing-strictness'] = ''
-        # Loop over options in SIMOPTIONS and extract the parameters we want
-        if 'simoptions' in self.input_dict:
-            if type(self.input_dict['simoptions'][0]) == str:
-                self.input_dict['simoptions'] = [self.input_dict['simoptions']]
-            for i, opt in enumerate(list(zip(*self.input_dict['simoptions']))[0]):
-                if opt == 'sim_path':
-                    self.options['sim_path'] = self.input_dict['simoptions'][i][1]
-                if opt == 'sim_flag':
-                    self.options['sim_flag'] = self.input_dict['simoptions'][i][1]
-                if opt == 'mpi':
-                    self.options['mpi'] = self.input_dict['simoptions'][i][1]
-                if opt == 'parsing-strictness':
-                    self.options['parsing-strictness'] = self.input_dict['simoptions'][i][1]
+        self.options['sim_path'] = simoptions.get('sim_path', '')
+        self.options['sim_flag'] = simoptions.get('sim_flag', '')
+        self.options['mpi'] = simoptions.get('mpi', '')
+        self.options['mpiarray'] = simoptions.get('mpiarray', '')
+        self.options['parsing-strictness'] = simoptions.get('parsing-strictness', '')
+        
         if 'sim_limit' in self.input_dict:
             self.options['sim_limit'] = self.input_dict['sim_limit']
 
+        if 'mem' in self.input_dict:
+            self.options['mem'] = self.input_dict['mem']
+
+        if 'python_ver' in self.input_dict:
+            self.options['python_ver'] = self.input_dict['python_ver']
+
+        if 'opm_ver' in self.input_dict:
+            self.options['opm_ver'] = self.input_dict['opm_ver']
+            
         if 'reportdates' in self.input_dict:
             self.reportdates = [
                 x * 30 for x in range(1, int(self.input_dict['reportdates'][1]))]
@@ -209,14 +228,16 @@ class eclipse:
         """
         Setup the simulator.
 
-        Parameters
+        Attributes
         ----------
-        assimIndex: int
+        assimIndex : int
             Gives the index-type (e.g. step,time,etc.) and the index for the
             data to be assimilated
-        trueOrder:
+        trueOrder : 
             Gives the index-type (e.g. step,time,etc.) and the index of the true data
         """
+
+        self.level = -1  # default value
         self.__dict__.update(kwargs)  # parse kwargs input into class attributes
 
         if hasattr(self, 'reportdates'):
@@ -254,7 +275,7 @@ class eclipse:
             sys.exit(
                 'ERROR: .mako file is not in the current working directory. This file must be defined')
 
-    def run_fwd_sim(self, state, member_i, del_folder=True):
+    def run_fwd_sim(self, state, member_i, del_folder=True,nosim=False):
         """
         Setup and run the ecl_100 forward simulator. All the parameters are defined as attributes, and the name of the
         parameters are initialized in setupFwdRun. This method sets up and runs all the individual ensemble members.
@@ -271,11 +292,14 @@ class eclipse:
 
         del_folder : bool, optional
             Boolean to determine if the ensemble folder should be deleted. Default is False.
+
+        nosim : bool, optional
+            Boolean to determine if the simulation should be run. Default is False.
         """
         if hasattr(self, 'level'):
             state['level'] = self.level
         else:
-            state['level'] = 0  # default value
+            state['level'] = -1  # default value
         os.mkdir('En_' + str(member_i))
         folder = 'En_' + str(member_i) + os.sep
 
@@ -293,7 +317,10 @@ class eclipse:
 
         # start by generating the .DATA file, using the .mako template situated in ../folder
         self._runMako(folder, state)
-        success = False
+        if nosim: # for hpc we only want to generate the .DATA file
+            return # exit the function
+        else:
+            success = False
         rerun = self.rerun
         while rerun >= 0 and not success:
             success = self.call_sim(folder, True)
@@ -301,9 +328,7 @@ class eclipse:
         if success:
             self.extract_data(member_i)
             if del_folder:
-                if self.saveinfo is not None:  # Try to save information. This relies on the use of a PET package which
-                    # needs to be imported.
-                    from pipt.misc_tools.analysis_tools import store_ensemble_sim_information
+                if self.saveinfo is not None:  # Try to save information
                     store_ensemble_sim_information(self.saveinfo, member_i)
                 self.remove_folder(member_i)
             return self.pred_data
@@ -313,8 +338,7 @@ class eclipse:
                 if success:
                     self.extract_data(member_i)
                     if del_folder:
-                        if self.saveinfo is not None:  # Try to save information. See comment above.
-                            from pipt.misc_tools.analysis_tools import store_ensemble_sim_information
+                        if self.saveinfo is not None:  # Try to save information
                             store_ensemble_sim_information(self.saveinfo, member_i)
                         self.remove_folder(member_i)
                     return self.pred_data
@@ -346,6 +370,7 @@ class eclipse:
                         data_array = self.get_sim_results(key, true_data_info, member)
                         self.pred_data[prim_ind][key] = data_array
                     except:
+                        print(f'Failed to extract {key} at {prim_ind} for member {member}')
                         pass
 
     def coarsen(self, folder, ensembleMember=None):
@@ -356,7 +381,7 @@ class eclipse:
 
         Parameters
         ----------
-        Folder : str, optional
+        folder : str, optional
             Path to the ecl_100 run folder.
 
         ensembleMember : int, optional
@@ -752,6 +777,10 @@ class eclipse:
             for key in self.report:
                 state[key] = self.report[key]
 
+        if 'mako_kwargs' in self.input_dict:
+            mako_kwargs = dict(self.input_dict['mako_kwargs'])
+            state.update(mako_kwargs)
+
         # Convert drilling order (float) to drilling queue (integer) - drilling order optimization
         # if "drillingorder" in en_dict:
         #     dorder = en_dict['drillingorder']
@@ -792,21 +821,15 @@ class eclipse:
 
         Parameters
         ----------
-        file_rsm : str
-            Summary file from ECL 100.
-
-        file_rst : str
-            Restart file from ECL 100.
-
         whichResponse : str
             Which of the responses is to be outputted (e.g., WBHP PRO-1, WOPR, PRESS, OILSAT, etc).
-
-        member : int, optional
-            Ensemble member that is finished.
 
         ext_data_info : tuple, optional
             Tuple containing the assimilation step information, including the place of assimilation (e.g., which TIME) and the
             index of this assimilation place.
+
+        member : int, optional
+            Ensemble member that is finished.
 
         Returns
         -------
@@ -1024,10 +1047,10 @@ class ecl_100(eclipse):
 
         Parameters
         ----------
-        Path : str
+        path : str
             Alternative folder for the ecl_100.data file.
 
-        Wait_for_proc : bool, optional
+        wait_for_proc : bool, optional
             Logical variable to wait for the simulator to finish. Default is False.
 
         Returns
@@ -1083,13 +1106,14 @@ class ecl_300(eclipse):
 
         Parameters
         ----------
-        Path : str
+        path : str
             Alternative folder for the ecl_100.data file.
 
-        Wait_for_proc : bool, optional
+        wait_for_proc : bool, optional
             Logical variable to wait for the simulator to finish. Default is False.
 
-        NOTE: For now, this option is only utilized in a single localization option.
+            !!! note
+                For now, this option is only utilized in a single localization option.
 
         Returns
         -------
