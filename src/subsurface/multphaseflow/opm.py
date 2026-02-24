@@ -96,14 +96,34 @@ class flow(eclipse):
         return finished_member
 
     @staticmethod
-    def SLURM_HPC_run(n_e, venv,filename, **kwargs):
+    def SLURM_HPC_run(n_e, venv, filename, **kwargs):
         """
         HPC run manager for SLURM.
 
         This function will start num_runs of sim.call_sim() using job arrays in SLURM.
+
+        Parameters
+        ----------
+        n_e : list[int]
+            Indices of ensemble members to simulate.
+        venv : str
+            Path to Python virtual environment activate script.
+        filename : str
+            Simulation input file.
+        kwargs : dict
+            Extra simulation options. Recognized:
+            - mpi (default None) (number of mpi processes) 
+            - sim_limit (defalut None) (float seconds or str HH:MM:SS)
+            - mem (default "4G") (memory requirement)
+            - opm_ver (default "")  (the system default will be used if not given as input)
+            - python_ver (defalut "") (the system default will be used if not given as input)
+            
         """
         # Extract the filename from the kwargs
         filename_str = f'"{filename.upper()}"' if filename is not None else ""
+    
+        # Ensure logs/ exists BEFORE writing script or running sbatch
+        os.makedirs("logs", exist_ok=True)
 
         # Extract mpi flag from kwargs
         mpi = kwargs.get("mpi", None)
@@ -136,7 +156,8 @@ class flow(eclipse):
 #SBATCH --ntasks={n_tasks}                                                                                          
 #SBATCH --cpus-per-task=2                                                                                 
 #SBATCH --export=ALL                                                                                      
-#SBATCH --output=/dev/null                                                                                
+#SBATCH --output=logs/job_%A_%a.out
+#SBATCH --error=logs/job_%A_%a.err                                                                            
 
 # OPTIONAL: load modules here                                                                             
 module load Python{python_ver}                                                                                        
@@ -153,7 +174,7 @@ python -m subsurface.multphaseflow.opm "$folder" {filename_str} {mpi_str}
         script_name = "submit_test_parallel_mpi.sh"
         with open(script_name, "w") as f:
             f.write(slurm_script)
-
+        
         # Make it executable (optional):
         os.chmod(script_name, 0o755)
 
