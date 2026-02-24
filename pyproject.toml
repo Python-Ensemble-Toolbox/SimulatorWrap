@@ -12,8 +12,15 @@ description = "A python package containing some usefull simulator wrappers."
 readme = "README.md"
 requires-python = ">=3.8"
 license = {file = "LICENSE"}
-dependencies = ["numpy", "scipy","mako","mat73","scikit-learn","resdata"
-  ]
+dependencies = [
+  "numpy", 
+  "scipy",
+  "mako",
+  "mat73",
+  "scikit-learn",
+  "jutuldarcy",
+  "pandas",
+]
 
 [project.urls]
 Homepage = "https://github.com/Python-Ensemble-Toolbox/SimulatorWrap"
