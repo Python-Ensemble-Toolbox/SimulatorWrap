@@ -187,7 +187,7 @@ class JutulDarcyWrapper:
                     }
         #---------------------------------------------------------------------------------------------------------
 
-    def __call__(self, inputs: list[dict]):
+    def __call__(self, inputs: list[dict]|dict|str):
         """
         Execute parallel forward simulations for all ensemble members.
 
@@ -196,8 +196,9 @@ class JutulDarcyWrapper:
 
         Parameters
         ----------
-        inputs : list of dict
-            List containing input parameter sets, indexed by ensemble member
+        inputs : list of dict, dict, or str
+            List containing input parameter sets, indexed by ensemble member, or a single input dictionary,
+            or a string representing a file path to input datafile.
 
             number (0, 1, 2, ...). Each value is a dict of parameters for that member.
 
@@ -224,6 +225,8 @@ class JutulDarcyWrapper:
         >>> inputs = [{'param1': [1, 2, 3]}, {'param1': [1.1, 2.1, 3.1]}]
         >>> results = simulator(inputs)
         """
+        if isinstance(inputs, (dict, str)):
+            inputs = [inputs]
 
         # Delet all existing En_* folders
         for item in os.listdir('.'):
@@ -252,7 +255,7 @@ class JutulDarcyWrapper:
             return outputs
                      
 
-    def run_fwd_sim(self, input: dict, idn: int=0, delete_folder: bool=True):
+    def run_fwd_sim(self, input: dict|str, idn: int=0, delete_folder: bool=True):
         """
         Execute a forward reservoir simulation for a single ensemble member.
 
@@ -263,8 +266,8 @@ class JutulDarcyWrapper:
 
         Parameters
         ----------
-        input : dict
-            Dictionary containing input parameters for the simulation. Typically includes
+        input : dict or str
+            Dictionary containing input parameters for the simulation or a string representing a file path to input datafile. Typically includes
             property grids (PERMX, PERMY, PERMZ, PORO) and other reservoir model parameters.
         idn : int, optional
             Ensemble member identifier (0, 1, 2, ...). Used to name the simulation folder
@@ -311,8 +314,16 @@ class JutulDarcyWrapper:
         folder = f'En_{idn}'
         os.makedirs(folder)
 
-        # Render makofile
-        self.render_makofile(self.makofile, folder, input)
+        if isinstance(input, dict):
+            # Render makofile
+            self.render_makofile(self.makofile, folder, input)
+        elif isinstance(input, str):
+            assert os.path.isfile(input), f'Input file {input} not found'
+            assert input.endswith('.DATA'), 'Input string must be a path to a .DATA file'
+            
+            # Copy datafile to simulation folder
+            self.datafile = os.path.basename(input)
+            shutil.copy(input, folder)
 
         # Enter simulation folder and run simulation
         os.chdir(folder)
