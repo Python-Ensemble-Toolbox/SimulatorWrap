@@ -470,8 +470,8 @@ class JutulDarcyWrapper:
                             unit = f'log({unit})'
 
                         # If col represents production data 
-                        if data_is_prod(col):
-                            grad_param = - grad_param
+                        #if data_is_prod(col):
+                        #    grad_param = - grad_param
                         
                         # Fill in dataframe and attributes
                         index = self.true_order[1][info['steps'][g]]
@@ -518,12 +518,12 @@ class JutulDarcyWrapper:
         Returns
         -------
         grad_param : np.ndarray
-            Processed gradient array.
+            Processed gradient array. (NB! Gradient is given as vector with fortran-order indexing)
         unit : str
             Unit string for the parameter.
         """
         if param.lower() == 'poro':
-            grad_param = np.array(grad[jl.Symbol("porosity")])
+            grad_param = np.array(grad[jl.Symbol("porosity")]) # F-order vector of active cells
             grad_param = _expand_to_full_grid(grad_param, actnum_vec, fill_value=0)
             return grad_param, 'Sm3'
 
@@ -534,8 +534,8 @@ class JutulDarcyWrapper:
 
             # Determine unit based on rate type
             if info['rate']:
-                days_per_sec = _convert_from_si(1.0, 'day', jl)
-                grad_param = grad_param / days_per_sec
+                sec_per_day = 24*60*60
+                grad_param = grad_param * sec_per_day  # Sm3/s --> Sm3/day
                 unit = 'Sm3/(day∙mD)'
             else:
                 unit = 'Sm3/mD'
@@ -977,6 +977,11 @@ def get_well_objective(well_id, rate_id, step_id, rate=True, accumulative=True, 
         dt = ''
     else:
         dt = 'dt*'
+
+    if data_is_prod(rate_id):
+        dt = '-' + dt
+    else:        
+        dt = ''
 
     # Case 1: Sum of all timesteps
     #-----------------------------------------------------------------------------
