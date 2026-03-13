@@ -96,6 +96,10 @@ class JutulDarcy:
         self.adjoint_pbar = options.get('adjoint_pbar', True)
         self.parallel = options.get('parallel', 1)
 
+        # This is for PET to work properly
+        self.input_dict = options
+        self.true_order = [self.reporttype, options['reportpoint']]
+
     
     def __call__(self, inputs: list[dict]|dict|str):
         """
