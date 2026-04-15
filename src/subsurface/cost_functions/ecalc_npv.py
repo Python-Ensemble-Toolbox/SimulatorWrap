@@ -126,7 +126,7 @@ def ecalc_npv(pred_data, **kwargs):
 
             # Extract
             energy = results_as_df(yaml_model, consumer_results, lambda r: r.component_result.energy_usage)
-            energy_total = energy.sum(1).rename("emissions_total")
+            energy_total = energy.sum(1).rename("energy_total")
             energy_total.to_csv(HERE / "energy.csv")
             Qel = energy_total.values * Dd  # total number of MWd (energy usage in MW * number of days)
             el_values.append(Qel)
