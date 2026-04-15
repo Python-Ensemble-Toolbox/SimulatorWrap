@@ -87,7 +87,7 @@ class JutulDarcy:
 
         # Report Options 
         self.report_type = options.get('reporttype', 'days') # days or dates
-        self.report = options.get('reportpoint', None)       # list of days or dates (datetime objects)
+        self.report = options.get('reportpoint', None)       # list of days or dates (dates as datetime objects)
         self.index = [self.report_type, self.report]
 
         # Process datatypes
@@ -106,7 +106,7 @@ class JutulDarcy:
             self.adjoint_funcs = None
 
         # Other options
-        self.output_format = options.get('output_format', 'list') # list, dict or dataframe
+        self.output_format = options.get('output_format', 'dataframe') # list, dict or dataframe
         self.adjoint_pbar = options.get('adjoint_pbar', True)
         self.parallel = options.get('parallel', 1)
 
@@ -257,6 +257,8 @@ class JutulDarcy:
         else:
             output = pyres
 
+
+        # ----------------------------------------------------------------------------------------------
         # Compute adjoints
         # ----------------------------------------------------------------------------------------------
         if self.compute_adjoints:
@@ -408,8 +410,9 @@ class JutulDarcy:
         report_days = []
         sim_days = np.array(list(smry["TIME"].seconds), dtype=np.int64) / (24*60*60)
         for d, sday in enumerate(sim_days):
-            if self.index[0] == 'days' and sday in self.index[1]:
-                report_days.append(int(sday))
+            if self.index[0] == 'days':
+                if sday in self.index[1]:
+                    report_days.append(int(sday))
             elif self.index[0] == 'dates':
                 sim_date = start_date + dt.timedelta(days=sday)
                 if sim_date in self.index[1]:
