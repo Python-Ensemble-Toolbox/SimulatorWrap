@@ -87,7 +87,7 @@ class JutulDarcy:
 
         # Report Options 
         self.report_type = options.get('reporttype', 'days') # days or dates
-        self.report = options.get('reportpoint', None)       # list of days or dates (datetime objects)
+        self.report = options.get('reportpoint', None)       # list of days or dates (dates as datetime objects)
         self.index = [self.report_type, self.report]
 
         # Process datatypes
@@ -106,7 +106,7 @@ class JutulDarcy:
             self.adjoint_funcs = None
 
         # Other options
-        self.output_format = options.get('output_format', 'list') # list, dict or dataframe
+        self.output_format = options.get('output_format', 'dataframe') # list, dict or dataframe
         self.adjoint_pbar = options.get('adjoint_pbar', True)
         self.parallel = options.get('parallel', 1)
 
@@ -241,9 +241,9 @@ class JutulDarcy:
             actnum_vec = np.ones(nx*ny*nz)
 
         # Simulate and get results
-        jlres = julia.simulate_reservoir(case, info_level=-1)
+        jlres = julia.simulate_reservoir(case, info_level=-1, output_substates=True)
         pyres, daysIDX = self.extract_datatypes(jlres, case, units, julia)
-
+        
         # Convert output to requested format
         if not self.output_format == 'dataframe':
             if self.output_format == 'dict':
@@ -257,6 +257,8 @@ class JutulDarcy:
         else:
             output = pyres
 
+
+        # ----------------------------------------------------------------------------------------------
         # Compute adjoints
         # ----------------------------------------------------------------------------------------------
         if self.compute_adjoints:
@@ -315,7 +317,8 @@ class JutulDarcy:
                 funcs = well_QOI_objective(
                     wellID=info['wellID'], 
                     phaseID=info['phase'], 
-                    stepID=stepIDX, 
+                    stepID=stepIDX,
+                    time=np.array(jlres.time),
                     rate=info['is_rate'], 
                     julia=julia
                 )
@@ -328,7 +331,7 @@ class JutulDarcy:
                 # Comute adjoint sensitivities
                 julia.case = case
                 julia.res = jlres
-                for func in funcs:
+                for i, func in enumerate(funcs):
                     julia.func = func
                     grad = julia.seval("""
                     redirect_stdout(devnull) do
@@ -344,7 +347,7 @@ class JutulDarcy:
                     # Evaluate functions
                     if self.eval_adjoint_funcs:
                         func_val = julia.Jutul.evaluate_objective(func, case, jlres.result)
-                        func_val = func_val*24*60*60 if info['is_rate'] else func_val
+                        func_val = func_val*julia.seval('si_unit(:day)') if info['is_rate'] else func_val
                         func_dict[col].append(func_val)
 
 
@@ -408,8 +411,9 @@ class JutulDarcy:
         report_days = []
         sim_days = np.array(list(smry["TIME"].seconds), dtype=np.int64) / (24*60*60)
         for d, sday in enumerate(sim_days):
-            if self.index[0] == 'days' and sday in self.index[1]:
-                report_days.append(int(sday))
+            if self.index[0] == 'days':
+                if sday in self.index[1]:
+                    report_days.append(int(sday))
             elif self.index[0] == 'dates':
                 sim_date = start_date + dt.timedelta(days=sday)
                 if sim_date in self.index[1]:
@@ -488,21 +492,19 @@ def _extract_adjoint(jlgrad, jlcase, parameter, actnum, is_rate, julia):
             adjoint = adjoint * perm.flatten(order='F')
             # Note: For dJ/dlog(perm) = dJ/dperm * perm, no need to convert from m2 to mD.
         else:
-            m2_per_mD = 9.86923000000e-16 # m2/mD
-            adjoint = adjoint * m2_per_mD
+            adjoint = adjoint * julia.seval('si_unit(:milli)*si_unit(:darcy)')
     else:
         raise ValueError(f"Adjoint not implemented for parameter '{parameter}'")
     
     if is_rate:
-            sec_per_day = 24*60*60
-            adjoint = adjoint * sec_per_day  # Convert from per sec to per day
+        adjoint = adjoint * julia.seval('si_unit(:day)')  # Convert from per sec to per day
 
     return adjoint
         
 
 def _active_to_full_grid(vec, actnum_vec, fill_value=0.0):
     if len(vec) == actnum_vec.sum():
-        full_vec = np.full(actnum_vec.shape, fill_value, dtype=np.float64)
+        full_vec = np.full(actnum_vec.shape, fill_value, dtype=np.float64, order='F')
         full_vec[actnum_vec == 1] = vec
         return full_vec
     if len(vec) == len(actnum_vec):
@@ -533,6 +535,7 @@ def _process_adjoint_info(adjoint_info):
         'WOPR': ('oil', True),
         'WGPR': ('gas', True),
         'WWPR': ('water', True),
+        'WWIR': ('water', True),
         'WLPR': ('liquid', True),
     }
     info = {}
@@ -582,7 +585,7 @@ def get_metric_unit(key: str) -> str:
     return unit_map.get(key.upper(), "Unknown")
 
 
-def well_QOI_objective(wellID, phaseID, stepID=None, rate=True, julia=None):
+def well_QOI_objective(wellID, phaseID, stepID=None, time=None, rate=True, julia=None):
     if julia is None:
         from juliacall import Main as julia
         julia.seval("using JutulDarcy")
@@ -632,7 +635,7 @@ def well_QOI_objective(wellID, phaseID, stepID=None, rate=True, julia=None):
             julia.seval(
                 f"""
                 function well_QOI_{sID}(model, state, dt, step_i, forces)
-                    if step_i[:step] != {sID+1}
+                    if (step_i[:step] != {sID+1}) && (step_i[:time] != {time[sID+1]})
                         return 0.0
                     else
                         ctrl = forces[:Facility].control[Symbol("{wellID}")]
@@ -661,7 +664,7 @@ def well_QOI_objective(wellID, phaseID, stepID=None, rate=True, julia=None):
     julia.seval(
         f"""
         function well_QOI(model, state, dt, step_i, forces)
-            if step_i[:step] != {stepID+1}
+            if (step_i[:step] != {stepID+1}) && (step_i[:time] != {time[stepID+1]})
                 return 0.0
             else
                 ctrl = forces[:Facility].control[Symbol("{wellID}")]
