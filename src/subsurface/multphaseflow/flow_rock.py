@@ -5,6 +5,7 @@ from subsurface.multphaseflow.opm import flow
 from importlib import import_module
 import datetime as dt
 import numpy as np
+import numpy.ma as ma
 import os
 import pandas as pd
 from misc import ecl, grdecl
@@ -58,9 +59,20 @@ class mixIn_multi_data():
         # Calculate z, x, and y positions
         z = (zcorn[c, 0, a, 0, b, 0] + zcorn[c, 0, a, 1, b, 0] + zcorn[c, 0, a, 0, b, 1] + zcorn[c, 0, a, 1, b, 1] +
              zcorn[c, 1, a, 0, b, 0] + zcorn[c, 1, a, 1, b, 0] + zcorn[c, 1, a, 0, b, 1] + zcorn[c, 1, a, 1, b, 1]) / 8
+        denom = zt - zb
+        valid = denom > 0
 
-        x = xb + (xt - xb) * (z - zb) / (zt - zb)
-        y = yb + (yt - yb) * (z - zb) / (zt - zb)
+        x = np.copy(xb).astype(float)
+        y = np.copy(yb).astype(float)
+
+        if np.any(valid):
+            frac = np.empty_like(z, dtype=float)
+            frac[valid] = (z[valid] - zb[valid]) / denom[valid]
+            x[valid] = xb[valid] + (xt[valid] - xb[valid]) * frac[valid]
+            y[valid] = yb[valid] + (yt[valid] - yb[valid]) * frac[valid]
+
+        #x = xb + (xt - xb) * (z - zb) / (zt - zb)
+        #y = yb + (yt - yb) * (z - zb) / (zt - zb)
 
         cell_centre = [x, y, z]
         return cell_centre
@@ -165,6 +177,62 @@ class mixIn_multi_data():
                                 np.abs(water_depth['z']), (pos['x'], pos['y']),
                                 method='nearest')  # z is positive downwards
         return pos
+
+    def filter_rporv(self, arr, cutoff = None, method='fixed', threshold=None, percentile=95.5, k=3.0,top_frac=0.01, ratio_thresh=10.0):
+
+        m = ma.array(arr, copy=True)
+
+        # convert object elements to floats if necessary
+        if m.dtype == object:
+            flat = np.array([getattr(x, 'value', x) for x in m.ravel()], dtype=float)
+            m = ma.array(flat.reshape(m.shape), mask=ma.getmaskarray(m))
+
+        data = m.compressed().astype(float)
+        if data.size == 0:
+            return m
+
+
+        if cutoff is None:
+            if method == 'fixed':
+                if threshold is None:
+                    raise ValueError("threshold required for method='fixed'")
+                cutoff = float(np.asarray(threshold).item())
+            elif method == 'percentile':
+                cutoff = float(np.nanpercentile(data, percentile))
+            elif method == 'sigma':
+                cutoff = float(np.nanmean(data) + k * np.nanstd(data))
+            elif method == 'median_relative':
+                # threshold here is interpreted as a multiplicative factor; if None, use median_factor
+                if threshold is None:
+                    raise ValueError("threshold (median factor) required for method='median_relative'")
+                factor = float(np.asarray(threshold).item())
+                med = float(np.nanmedian(data))
+                cutoff = med * factor
+            else:
+                raise ValueError("unknown method")
+
+
+        # preserve original mask, set values > cutoff to 0.0 in the underlying data
+        orig_mask = ma.getmaskarray(m)
+        filled = m.filled(np.nan).astype(float)
+
+        # Decide whether aquifer-like outliers exist
+        n_top = max(1, int(np.ceil(top_frac * data.size)))
+        sorted_vals = np.sort(data)
+        top_vals = sorted_vals[-n_top:]
+        median_bulk = float(np.nanmedian(sorted_vals[:-n_top]) if data.size > n_top else np.nanmedian(sorted_vals))
+        mean_top = float(np.nanmean(top_vals))
+        aquifer_present = False
+        if np.isfinite(median_bulk) and median_bulk > 0:
+            if (mean_top / median_bulk) >= ratio_thresh:
+                aquifer_present = True
+        # only remove cells, if very big
+        if aquifer_present:
+            print(f'Remove aquifer cells')
+            filled[filled > cutoff] = 0.0
+
+        res = ma.array(filled, mask=orig_mask)
+        return res, cutoff
 
 
 class flow_rock(flow):
@@ -1049,7 +1117,7 @@ class flow_avo(flow_rock, mixIn_multi_data):
             vintage.append(deepcopy(avo))
 
             if v == 0:
-                save_dic = {'avo': avo, 'noise_std': noise_std, 'Rpp': Rpp, 'Vs': vs_sample, 'Vp': vp_sample, 'PRESSURE': PRESSURE, 'SGAS': SGAS, **self.avo_config}
+                save_dic = {'base_time': base_time, 'avo': avo, 'noise_std': noise_std, 'Rpp': Rpp, 'Vs': vs_sample, 'Vp': vp_sample, 'PRESSURE': PRESSURE, 'SGAS': SGAS, **self.avo_config, **self.pem_input}
                 #save_dic = {'avo': avo, 'noise_std': noise_std, 'Rpp': Rpp, 'Vs': vs_sample, 'Vp': vp_sample, 'rho': rho_sample, #**self.avo_config,
                 #        'Vs_bl': vs_baseline, 'Vp_bl': vp_baseline, 'avo_bl': avo_baseline, 'Rpp_bl': Rpp_baseline, 'rho_bl': rho_baseline, **self.avo_config}
                 #save_dic = {'avo': avo, 'noise_std': noise_std, 'Rpp': Rpp, 'Vs': vs_sample, 'Vp': vp_sample,
@@ -1779,12 +1847,13 @@ class flow_grav(flow_rock, mixIn_multi_data):
             base_time = dt.datetime(self.startDate['year'], self.startDate['month'],
                                     self.startDate['day']) + dt.timedelta(days=self.grav_config['baseline'])
             # porosity, saturation, densities, and fluid mass at time of baseline survey
-            grav_base = self.calc_mass(base_time, 0)
+            grav_base, cutoff_base = self.calc_mass(base_time, 0, cutoff_base=None)
 
 
         else:
             # seafloor gravity only works in 4D mode
             grav_base = None
+            cutoff_base = None
             print('Need to specify Baseline survey for gravity in input file')
 
         for v, assim_time in enumerate(self.grav_config['vintage']):
@@ -1792,7 +1861,7 @@ class flow_grav(flow_rock, mixIn_multi_data):
                    dt.timedelta(days=assim_time)
 
             # porosity, saturation, densities, and fluid mass at individual time-steps
-            grav_struct[v] = self.calc_mass(time, v+1)  # calculate the mass of each fluid in each grid cell
+            grav_struct[v], _ = self.calc_mass(time, v+1, cutoff_base=cutoff_base)  # calculate the mass of each fluid in each grid cell
 
 
 
@@ -1840,7 +1909,7 @@ class flow_grav(flow_rock, mixIn_multi_data):
         for i, elem in enumerate(vintage):
             self.grav_result.append(elem)
 
-    def calc_mass(self, time, time_index = None):
+    def calc_mass(self, time, time_index = None, cutoff_base = None):
 
         if self.no_flow:
             time_input = time_index
@@ -1856,6 +1925,8 @@ class flow_grav(flow_rock, mixIn_multi_data):
 
 
         tmp = self._get_pem_input('RPORV', time_input)
+
+        tmp, cutoff = self.filter_rporv(tmp, cutoff = cutoff_base, method='percentile', percentile=90)
         grav_input['RPORV'] = np.array(tmp[~tmp.mask], dtype=float)
 
         tmp = self._get_pem_input('PRESSURE', time_input)
@@ -1978,7 +2049,7 @@ class flow_grav(flow_rock, mixIn_multi_data):
             mass = var + '_mass'
             grav_input[mass] = grav_input[var + '_DEN'] * grav_input['S' + var] * grav_input['RPORV']
 
-        return grav_input
+        return grav_input, cutoff
 
     def calc_grav(self, grid, grav_base, grav_repeat, pos):
 
@@ -2003,7 +2074,7 @@ class flow_grav(flow_rock, mixIn_multi_data):
             dm = grav_repeat['OIL_mass'] + grav_repeat['GAS_mass'] - (grav_base['OIL_mass'] + grav_base['GAS_mass'])
             # dm = grav_repeat['WAT_mass'] + grav_repeat['GAS_mass'] - (grav_base['WAT_mass'] + grav_base['GAS_mass'])
 
-        elif 'WAT' in phases and 'GAS' in phases:  # Smeaheia model
+        elif 'WAT' in phases and 'GAS' in phases:  # Smeaheia or SPE11 model
             dm  = grav_repeat['WAT_mass'] + grav_repeat['GAS_mass'] - (grav_base['WAT_mass'] + grav_base['GAS_mass'])
             #dm = grav_repeat['WAT_mass'] + grav_repeat['GAS_mass'] - (grav_base['WAT_mass'] + grav_base['GAS_mass'])
 
@@ -2128,11 +2199,12 @@ class flow_seafloor_disp(flow_rock, mixIn_multi_data):
             base_time = dt.datetime(self.startDate['year'], self.startDate['month'],
                                     self.startDate['day']) + dt.timedelta(days=self.disp_config['baseline'])
             # pore volume at time of baseline survey
-            disp_base = self.get_pore_volume(base_time, 0)
+            disp_base, cutoff_base  = self.get_pore_volume(base_time, 0)
 
         else:
             # seafloor  displacement only work in 4D mode
             disp_base = None
+            cutoff_base = None
             print('Need to specify Baseline survey for displacement modelling in input file')
 
         for v, assim_time in enumerate(self.disp_config['vintage']):
@@ -2140,7 +2212,7 @@ class flow_seafloor_disp(flow_rock, mixIn_multi_data):
                    dt.timedelta(days=assim_time)
 
             # pore volume and pressure at individual time-steps
-            disp_struct[v] = self.get_pore_volume(time, v+1)  # calculate the mass of each fluid in each grid cell
+            disp_struct[v], _ = self.get_pore_volume(time, v+1)  # calculate the mass of each fluid in each grid cell
 
         vintage = []
 
@@ -2168,7 +2240,7 @@ class flow_seafloor_disp(flow_rock, mixIn_multi_data):
         for i, elem in enumerate(vintage):
             self.disp_result.append(elem)
 
-    def get_pore_volume(self, time, time_index = None):
+    def get_pore_volume(self, time, time_index = None, cutoff_base = None):
 
         if self.no_flow:
             time_input = time_index
@@ -2181,6 +2253,7 @@ class flow_seafloor_disp(flow_rock, mixIn_multi_data):
 
 
         tmp = self._get_pem_input('RPORV', time_input)
+        tmp, cutoff = self.filter_rporv(tmp, cutoff=cutoff_base, method='percentile', percentile=90)
         disp_input['RPORV'] = np.array(tmp[~tmp.mask], dtype=float)
 
         tmp = self._get_pem_input('PRESSURE', time_input)
@@ -2200,7 +2273,7 @@ class flow_seafloor_disp(flow_rock, mixIn_multi_data):
         tmp_dyn_var['RPORV'] = disp_input['RPORV']
         self.dyn_var.extend([tmp_dyn_var])
 
-        return disp_input
+        return disp_input, cutoff
 
     def compute_horizontal_distance(self, pos, x, y):
         dx = pos['x'][:, np.newaxis] - x
