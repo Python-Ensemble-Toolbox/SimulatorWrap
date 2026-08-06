@@ -241,6 +241,12 @@ python -m subsurface.multphaseflow.opm "$folder" {filename_str} {mpi_str}
         mem = kwargs.get("mem", "4G")
         cpus_per_task = kwargs.get("cpus_per_task", 1)
 
+        # extract opm simulator version
+        opm_ver = kwargs.get("opm_ver", "")  # e.g., "/2025.04-foss-2024a" (remember the leading /)
+
+        # extract Python version
+        python_ver = kwargs.get("python_ver", "")  # e.g., "/3.12.3-GCCcore-13.3.0" (remember the leading /)
+
         slurm_script = f"""#!/bin/bash
 #SBATCH --job-name=EnDA_array
 #SBATCH --partition=comp
@@ -250,10 +256,11 @@ python -m subsurface.multphaseflow.opm "$folder" {filename_str} {mpi_str}
 #SBATCH {sim_limit_str}
 #SBATCH --output=logs/job_%A_%a.out
 #SBATCH --error=logs/job_%A_%a.err
+                                                                    
+module load Python{python_ver}                                                                                        
+export LMOD_DISABLE_SAME_NAME_AUTOSWAP=no                                                                 
+module load opm-simulators{opm_ver}
 
-module load Python
-export LMOD_DISABLE_SAME_NAME_AUTOSWAP=no
-module load opm-simulators
 source {venv}
 
 IDX=$(( {start_idx} + SLURM_ARRAY_TASK_ID ))
