@@ -140,6 +140,9 @@ class eclipse:
         if 'mem' in self.input_dict:
             self.options['mem'] = self.input_dict['mem']
 
+        if 'cpus_per_task' in self.input_dict:
+            self.options['cpus_per_task'] = self.input_dict['cpus_per_task']
+
         if 'python_ver' in self.input_dict:
             self.options['python_ver'] = self.input_dict['python_ver']
 
