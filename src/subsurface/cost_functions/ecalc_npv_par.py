@@ -3,6 +3,7 @@ import numpy  as np
 import os
 import yaml
 import time
+import sys
 
 from pathlib import Path
 from multiprocessing import Pool
@@ -110,8 +111,17 @@ def _objective(args):
     water_prod = sim_data['fwpt'][nc]
     water_inj = sim_data['fwit'][nc]
 
+    # Check if reinjection is used - reinjected water may come from other assets (if water_inj > water_prood)
+    if 'wwri' in const:
+        water_prod = np.maximum(water_prod - water_inj, 0.0)  # pay only for produced water that is not reinjected
+        water_reinj = water_inj  # pay for separation of the reinjected water (wwri is mainly the cost of separation)
+    else:
+        water_reinj = 0.0
+        const['wwri'] = 0.0
+
     value = (oil_export * const['wop'] + gas_export * const['wgp'] - water_prod * const['wwp'] -
-             water_inj * const['wwi'] - em_mass * const['wem'] - el_usage * const['wel']) / (
+             water_inj * const['wwi'] - water_reinj * const['wwri'] -
+             em_mass * const['wem'] - el_usage * const['wel']) / (
                     (1 + const['disc']) ** (np.cumsum(sim_data['days']) / 365))
 
     return np.sum(value)
