@@ -144,6 +144,10 @@ class flow(eclipse):
 
         # extract Python version
         python_ver = kwargs.get("python_ver", "") # e.g., "/3.12.3-GCCcore-13.3.0" (remember the leading /)
+        if python_ver:
+            py_string = f"module load Python{python_ver}\nexport LMOD_DISABLE_SAME_NAME_AUTOSWAP=no"
+        else:
+            py_string = ""
         
         diff_ne = n_e[-1] - n_e[0]
 
@@ -161,9 +165,10 @@ class flow(eclipse):
 exec > /dev/null 2>&1
                                                                             
 # OPTIONAL: load modules here                                                                             
-module load Python{python_ver}                                                                                        
-export LMOD_DISABLE_SAME_NAME_AUTOSWAP=no                                                                 
+{py_string}                                                              
 module load opm-simulators{opm_ver}                                                                                
+
+export OMP_NUM_THREADS=$SLURM_CPUS_PER_TASK
 
 source {venv}                                                                    
 
