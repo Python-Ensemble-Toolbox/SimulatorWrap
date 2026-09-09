@@ -1187,7 +1187,7 @@ class ecl_100(eclipse):
                     call(com, stdout=DEVNULL, timeout=self.options['sim_limit'])
                 else:
                     call(com, stdout=DEVNULL)
-                raise ValueError
+                # raise ValueError  # bug: this unconditionally forced every run into the except branch below
         except:
             print('\nError in the eclipse run.')  # add rerun?
             if not os.path.exists('Crashdump'):
