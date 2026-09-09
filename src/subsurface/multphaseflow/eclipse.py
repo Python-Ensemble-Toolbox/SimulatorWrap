@@ -346,7 +346,7 @@ class eclipse:
                 if self.saveinfo is not None:  # Try to save information
                     store_ensemble_sim_information(self.saveinfo, member_i)
                 self.remove_folder(member_i)
-            return self.pred_data
+            return deepcopy(self.pred_data)
         else:
             if self.redund_sim is not None:
                 success = self.redund_sim.call_sim(folder, True)
@@ -356,7 +356,7 @@ class eclipse:
                         if self.saveinfo is not None:  # Try to save information
                             store_ensemble_sim_information(self.saveinfo, member_i)
                         self.remove_folder(member_i)
-                    return self.pred_data
+                    return deepcopy(self.pred_data)
                 else:
                     if del_folder:
                         self.remove_folder(member_i)
