@@ -140,6 +140,9 @@ class eclipse:
         if 'mem' in self.input_dict:
             self.options['mem'] = self.input_dict['mem']
 
+        if 'cpus_per_task' in self.input_dict:
+            self.options['cpus_per_task'] = self.input_dict['cpus_per_task']
+
         if 'python_ver' in self.input_dict:
             self.options['python_ver'] = self.input_dict['python_ver']
 
@@ -343,7 +346,7 @@ class eclipse:
                 if self.saveinfo is not None:  # Try to save information
                     store_ensemble_sim_information(self.saveinfo, member_i)
                 self.remove_folder(member_i)
-            return self.pred_data
+            return deepcopy(self.pred_data)
         else:
             if self.redund_sim is not None:
                 success = self.redund_sim.call_sim(folder, True)
@@ -353,7 +356,7 @@ class eclipse:
                         if self.saveinfo is not None:  # Try to save information
                             store_ensemble_sim_information(self.saveinfo, member_i)
                         self.remove_folder(member_i)
-                    return self.pred_data
+                    return deepcopy(self.pred_data)
                 else:
                     if del_folder:
                         self.remove_folder(member_i)
@@ -1184,7 +1187,7 @@ class ecl_100(eclipse):
                     call(com, stdout=DEVNULL, timeout=self.options['sim_limit'])
                 else:
                     call(com, stdout=DEVNULL)
-                raise ValueError
+                # raise ValueError  # bug: this unconditionally forced every run into the except branch below
         except:
             print('\nError in the eclipse run.')  # add rerun?
             if not os.path.exists('Crashdump'):

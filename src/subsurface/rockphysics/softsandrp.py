@@ -772,14 +772,21 @@ class elasticproperties:
         # Calculate Hertz-Mindlin moduli
         #
         bulkhm, shearhm = self._hertzmindlin_Mavko(peff, bulks, shears, coordnumber, phicritical)
+
+        if shearhm > 50000:
+            print(f"WARNING: Hertz-Mindlin shear modulus seems too high {shearhm}, peff {peff}")
+
+        #if poro / phicritical > 0.95:
+        #    print(f"WARNING: Porosity very close to critical porosity: {phicritical}")
+        poro_ratio = min(poro / phicritical, 0.90)
         #
-        bulkd = 1 / ((poro / phicritical) / (bulkhm + 4 / 3 * shearhm) +
-                     (1 - poro / phicritical) / (bulks + 4 / 3 * shearhm)) - 4 / 3 * shearhm
+        bulkd = 1 / ((poro_ratio) / (bulkhm + 4 / 3 * shearhm) +
+                     (1 - poro_ratio) / (bulks + 4 / 3 * shearhm)) - 4 / 3 * shearhm
 
         psi = (9 * bulkhm + 8 * shearhm) / (bulkhm + 2 * shearhm)
 
-        sheard = 1 / ((poro / phicritical) / (shearhm + 1 / 6 * psi * shearhm) +
-                     (1 - poro / phicritical) / (shears + 1 / 6 * psi * shearhm)) - 1 / 6 * psi * shearhm
+        sheard = 1 / ((poro_ratio) / (shearhm + 1 / 6 * psi * shearhm) +
+                     (1 - poro_ratio) / (shears + 1 / 6 * psi * shearhm)) - 1 / 6 * psi * shearhm
 
         #return K_dry, G_dry
         return bulkd, sheard
@@ -822,7 +829,16 @@ class elasticproperties:
                ((3 * coordnumber ** 2 * (1 - phicritical) ** 2 * shears ** 2 * peff) /
                 (2 * np.pi ** 2 * (1 - poisson) ** 2)) ** (1 / 3)
 
+        #poisson = (3 * bulks - 2 * shears) / (6 * bulks + 2 * shears)
+        #print(f"  Calculated Poisson's ratio: {poisson}")  # Should be ~0.1-0.3
 
+        # Check the terms in the formula:
+        #term1 = coordnumber ** 2 * (1 - phicritical) ** 2 * shears ** 2 * peff
+        #term2 = 18 * np.pi ** 2 * (1 - poisson) ** 2
+        #print(f"  Numerator term: {term1}")
+        #print(f"  Denominator term: {term2}")
+        #print(f"  Ratio: {term1 / term2}")
+        #print(f"  Cube root: {(term1 / term2) ** (1 / 3)}")
 
         #
         return bulkhm, shearhm

@@ -123,7 +123,7 @@ class flow(eclipse):
         filename_str = f'"{filename.upper()}"' if filename is not None else ""
     
         # Ensure logs/ exists BEFORE writing script or running sbatch
-        os.makedirs("logs", exist_ok=True)
+        # os.makedirs("logs", exist_ok=True)
 
         # Extract mpi flag from kwargs
         mpi = kwargs.get("mpi", None)
@@ -144,6 +144,10 @@ class flow(eclipse):
 
         # extract Python version
         python_ver = kwargs.get("python_ver", "") # e.g., "/3.12.3-GCCcore-13.3.0" (remember the leading /)
+        if python_ver:
+            py_string = f"module load Python{python_ver}\nexport LMOD_DISABLE_SAME_NAME_AUTOSWAP=no"
+        else:
+            py_string = ""
         
         diff_ne = n_e[-1] - n_e[0]
 
@@ -156,13 +160,15 @@ class flow(eclipse):
 #SBATCH --ntasks={n_tasks}                                                                                          
 #SBATCH --cpus-per-task=2                                                                                 
 #SBATCH --export=ALL                                                                                      
-#SBATCH --output=logs/job_%A_%a.out
-#SBATCH --error=logs/job_%A_%a.err                                                                            
-
+#SBATCH --output=/dev/null
+#SBATCH --error=/dev/null
+exec > /dev/null 2>&1
+                                                                            
 # OPTIONAL: load modules here                                                                             
-module load Python{python_ver}                                                                                        
-export LMOD_DISABLE_SAME_NAME_AUTOSWAP=no                                                                 
+{py_string}                                                              
 module load opm-simulators{opm_ver}                                                                                
+
+export OMP_NUM_THREADS=$SLURM_CPUS_PER_TASK
 
 source {venv}                                                                    
 
@@ -183,7 +189,11 @@ python -m subsurface.multphaseflow.opm "$folder" {filename_str} {mpi_str}
 
         # Submit the script to SLURM
         cmd = ["sbatch", script_name]
-        result = run(cmd, capture_output=True, text=True)
+        try:
+            result = run(cmd, capture_output=True, text=True, timeout=30)
+        except Exception as e:
+            print(f"sbatch failed: {e}", flush=True)
+            return None
 
         # remove script file
         os.remove(script_name)
@@ -236,6 +246,12 @@ python -m subsurface.multphaseflow.opm "$folder" {filename_str} {mpi_str}
         mem = kwargs.get("mem", "4G")
         cpus_per_task = kwargs.get("cpus_per_task", 1)
 
+        # extract opm simulator version
+        opm_ver = kwargs.get("opm_ver", "")  # e.g., "/2025.04-foss-2024a" (remember the leading /)
+
+        # extract Python version
+        python_ver = kwargs.get("python_ver", "")  # e.g., "/3.12.3-GCCcore-13.3.0" (remember the leading /)
+
         slurm_script = f"""#!/bin/bash
 #SBATCH --job-name=EnDA_array
 #SBATCH --partition=comp
@@ -245,10 +261,11 @@ python -m subsurface.multphaseflow.opm "$folder" {filename_str} {mpi_str}
 #SBATCH {sim_limit_str}
 #SBATCH --output=logs/job_%A_%a.out
 #SBATCH --error=logs/job_%A_%a.err
+                                                                    
+module load Python{python_ver}                                                                                        
+export LMOD_DISABLE_SAME_NAME_AUTOSWAP=no                                                                 
+module load opm-simulators{opm_ver}
 
-module load Python
-export LMOD_DISABLE_SAME_NAME_AUTOSWAP=no
-module load opm-simulators
 source {venv}
 
 IDX=$(( {start_idx} + SLURM_ARRAY_TASK_ID ))

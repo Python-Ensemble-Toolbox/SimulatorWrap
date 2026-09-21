@@ -5,6 +5,7 @@ from subsurface.multphaseflow.opm import flow
 from importlib import import_module
 import datetime as dt
 import numpy as np
+import numpy.ma as ma
 import os
 import pandas as pd
 from misc import ecl, grdecl
@@ -31,7 +32,6 @@ import sys
 #from PyGRDECL.GRDECL_Parser import GRDECL_Parser  # https://github.com/BinWang0213/PyGRDECL/tree/master
 from scipy.interpolate import interp1d
 from scipy.interpolate import griddata
-from pipt.misc_tools.analysis_tools import store_ensemble_sim_information
 from geostat.decomp import Cholesky
 #from simulator.eclipse import ecl_100
 from CoolProp.CoolProp import PropsSI  # http://coolprop.org/#high-level-interface-example
@@ -58,9 +58,20 @@ class mixIn_multi_data():
         # Calculate z, x, and y positions
         z = (zcorn[c, 0, a, 0, b, 0] + zcorn[c, 0, a, 1, b, 0] + zcorn[c, 0, a, 0, b, 1] + zcorn[c, 0, a, 1, b, 1] +
              zcorn[c, 1, a, 0, b, 0] + zcorn[c, 1, a, 1, b, 0] + zcorn[c, 1, a, 0, b, 1] + zcorn[c, 1, a, 1, b, 1]) / 8
+        denom = zt - zb
+        valid = denom > 0
 
-        x = xb + (xt - xb) * (z - zb) / (zt - zb)
-        y = yb + (yt - yb) * (z - zb) / (zt - zb)
+        x = np.copy(xb).astype(float)
+        y = np.copy(yb).astype(float)
+
+        if np.any(valid):
+            frac = np.empty_like(z, dtype=float)
+            frac[valid] = (z[valid] - zb[valid]) / denom[valid]
+            x[valid] = xb[valid] + (xt[valid] - xb[valid]) * frac[valid]
+            y[valid] = yb[valid] + (yt[valid] - yb[valid]) * frac[valid]
+
+        #x = xb + (xt - xb) * (z - zb) / (zt - zb)
+        #y = yb + (yt - yb) * (z - zb) / (zt - zb)
 
         cell_centre = [x, y, z]
         return cell_centre
@@ -105,13 +116,10 @@ class mixIn_multi_data():
         # allow for finer measurement grid around injection well
         if well_coord is not None:
             # choose center point and radius for area with finer measurement grid
-            # y = 64, x = 34  # alpha well position Smeaheia
-            if isinstance(cell_centre, list):
-                xc = np.unique(cell_centre[0])[well_coord[0]]
-                yc = np.unique(cell_centre[1])[well_coord[1]]
-            else:
-                xc = cell_centre[well_coord[0]]
-                yc = cell_centre[well_coord[1]]
+            # well_coord should be [x_coordinate, y_coordinate] instead of grid indices
+            # Example: [2700.0, 1000.0] for Smeaheia instead of [34, 64]
+            xc = well_coord[0]
+            yc = well_coord[1]
 
             dxy_fine = round(dxy/2)
 
@@ -165,6 +173,62 @@ class mixIn_multi_data():
                                 np.abs(water_depth['z']), (pos['x'], pos['y']),
                                 method='nearest')  # z is positive downwards
         return pos
+
+    def filter_rporv(self, arr, cutoff = None, method='fixed', threshold=None, percentile=95.5, k=3.0,top_frac=0.01, ratio_thresh=10.0):
+
+        m = ma.array(arr, copy=True)
+
+        # convert object elements to floats if necessary
+        if m.dtype == object:
+            flat = np.array([getattr(x, 'value', x) for x in m.ravel()], dtype=float)
+            m = ma.array(flat.reshape(m.shape), mask=ma.getmaskarray(m))
+
+        data = m.compressed().astype(float)
+        if data.size == 0:
+            return m
+
+
+        if cutoff is None:
+            if method == 'fixed':
+                if threshold is None:
+                    raise ValueError("threshold required for method='fixed'")
+                cutoff = float(np.asarray(threshold).item())
+            elif method == 'percentile':
+                cutoff = float(np.nanpercentile(data, percentile))
+            elif method == 'sigma':
+                cutoff = float(np.nanmean(data) + k * np.nanstd(data))
+            elif method == 'median_relative':
+                # threshold here is interpreted as a multiplicative factor; if None, use median_factor
+                if threshold is None:
+                    raise ValueError("threshold (median factor) required for method='median_relative'")
+                factor = float(np.asarray(threshold).item())
+                med = float(np.nanmedian(data))
+                cutoff = med * factor
+            else:
+                raise ValueError("unknown method")
+
+
+        # preserve original mask, set values > cutoff to 0.0 in the underlying data
+        orig_mask = ma.getmaskarray(m)
+        filled = m.filled(np.nan).astype(float)
+
+        # Decide whether aquifer-like outliers exist
+        n_top = max(1, int(np.ceil(top_frac * data.size)))
+        sorted_vals = np.sort(data)
+        top_vals = sorted_vals[-n_top:]
+        median_bulk = float(np.nanmedian(sorted_vals[:-n_top]) if data.size > n_top else np.nanmedian(sorted_vals))
+        mean_top = float(np.nanmean(top_vals))
+        aquifer_present = False
+        if np.isfinite(median_bulk) and median_bulk > 0:
+            if (mean_top / median_bulk) >= ratio_thresh:
+                aquifer_present = True
+        # only remove cells, if very big
+        if aquifer_present:
+            print(f'Remove aquifer cells')
+            filled[filled > cutoff] = 0.0
+
+        res = ma.array(filled, mask=orig_mask)
+        return res, cutoff
 
 
 class flow_rock(flow):
@@ -242,6 +306,8 @@ class flow_rock(flow):
                           self.pem_input['model'].split()[0]), self.pem_input['model'].split()[1])
 
             self.pem = pem(self.pem_input)
+            if not hasattr(self.pem, 'input'):
+                self.pem.input = self.pem_input
 
         else:
             self.pem = None
@@ -265,6 +331,36 @@ class flow_rock(flow):
         else:  # get variable of parameter from flow simulation
             return self.ecl_case.cell_data(type,time)
 
+    def _recover_missing_well_summary_data(self, member):
+        """Backfill missing well-summary values when key separators differ (space vs colon)."""
+        try:
+            case = ecl.EclipseCase('En_' + str(member) + os.sep + self.file)
+        except Exception:
+            return
+
+        for prim_ind in self.l_prim:
+            if self.true_prim[0] == 'days':
+                time = dt.datetime(self.startDate['year'], self.startDate['month'], self.startDate['day']) + \
+                    dt.timedelta(days=self.true_prim[1][prim_ind])
+            else:
+                time = self.true_prim[1][prim_ind]
+
+            for key in self.all_data_types:
+                if self.pred_data[prim_ind][key] is not None:
+                    continue
+                # Only attempt recovery for well-summary style keys (e.g. "WBHP INJ0").
+                if len(key.split(' ')) != 2 or 'rft_' in key.lower():
+                    continue
+
+                for cand in (key, key.replace(' ', ':'), key.replace(':', ' ')):
+                    try:
+                        val = case.summary_data(cand, time)
+                    except Exception:
+                        val = None
+                    if val is not None:
+                        self.pred_data[prim_ind][key] = val
+                        break
+
     def calc_pem(self, time, time_index=None):
 
         if self.no_flow:
@@ -278,15 +374,15 @@ class flow_rock(flow):
         tmp_dyn_var = {}
         # get active porosity
         tmp = self._get_pem_input('PORO')  # self.ecl_case.cell_data('PORO')
-        if 'compaction' in self.pem_input:
+        if 'compaction' in self.pem.input:
             multfactor = self._get_pem_input('PORV_RC', time_input)
             pem_input['PORO'] = np.array(multfactor[~tmp.mask] * tmp[~tmp.mask], dtype=float)
         else:
             pem_input['PORO'] = np.array(tmp[~tmp.mask], dtype=float)
 
         # get active NTG if needed
-        if 'ntg' in self.pem_input:
-            if self.pem_input['ntg'] == 'no':
+        if 'ntg' in self.pem.input:
+            if self.pem.input['ntg'] == 'no':
                 pem_input['NTG'] = None
             else:
                 tmp = self._get_pem_input('NTG')
@@ -295,28 +391,30 @@ class flow_rock(flow):
             tmp = self._get_pem_input('NTG')
             pem_input['NTG'] = np.array(tmp[~tmp.mask], dtype=float)
 
-        if 'RS' in self.pem_input: #ecl_case.cell_data: # to be more robust!
+        if 'RS' in self.pem.input: #ecl_case.cell_data: # to be more robust!
             tmp = self._get_pem_input('RS', time_input)
             pem_input['RS'] = np.array(tmp[~tmp.mask], dtype=float)
         else:
             pem_input['RS'] = None
-            print('RS is not a variable in the ecl_case')
+            if not hasattr(self, '_rs_warned') or not self._rs_warned:
+                print('RS is not a variable in the ecl_case')
+                self._rs_warned = True
 
         # extract pressure
         tmp = self._get_pem_input('PRESSURE', time_input)
         pem_input['PRESSURE'] = np.array(tmp[~tmp.mask], dtype=float)
 
         # convert pressure from Bar to MPa
-        if 'press_conv' in self.pem_input and time_input == time:
-            pem_input['PRESSURE'] = pem_input['PRESSURE'] * self.pem_input['press_conv']
+        if 'press_conv' in self.pem.input and time_input == time:
+            pem_input['PRESSURE'] = pem_input['PRESSURE'] * self.pem.input['press_conv']
 
         if hasattr(self.pem, 'p_init'):
             P_init = self.pem.p_init * np.ones(tmp.shape)[~tmp.mask]
         else:
             P_init = np.array(tmp[~tmp.mask], dtype=float)  # initial pressure is first
 
-        if 'press_conv' in self.pem_input and time_input == time:
-            P_init = P_init * self.pem_input['press_conv']
+        if 'press_conv' in self.pem.input and time_input == time:
+            P_init = P_init * self.pem.input['press_conv']
 
         # extract saturations
         if 'OIL' in phases and 'WAT' in phases and 'GAS' in phases:  # This should be extended
@@ -426,7 +524,7 @@ class flow_rock(flow):
             self.dyn_var = []
             vintage = []
             # loop over seismic vintages
-            for v, assim_time in enumerate(self.pem_input['vintage']):
+            for v, assim_time in enumerate(self.pem.input['vintage']):
                 time = dt.datetime(self.startDate['year'], self.startDate['month'], self.startDate['day']) + \
                         dt.timedelta(days=assim_time)
 
@@ -471,14 +569,15 @@ class flow_rock(flow):
     def extract_data(self, member):
         # start by getting the data from the flow simulator
         super().extract_data(member)
+        self._recover_missing_well_summary_data(member)
 
         # get the sim2seis from file
         for prim_ind in self.l_prim:
             # Loop over all keys in pred_data (all data types)
             for key in self.all_data_types:
                 if key in ['bulkimp']:
-                    if self.true_prim[1][prim_ind] in self.pem_input['vintage']:
-                        v = self.pem_input['vintage'].index(self.true_prim[1][prim_ind])
+                    if self.true_prim[1][prim_ind] in self.pem.input['vintage']:
+                        v = self.pem.input['vintage'].index(self.true_prim[1][prim_ind])
                         self.pred_data[prim_ind][key] = self.pem_result[v].data.flatten()
 
 class flow_sim2seis(flow):
@@ -543,6 +642,8 @@ class flow_sim2seis(flow):
                           self.pem_input['model'].split()[0]), self.pem_input['model'].split()[1])
 
             self.pem = pem(self.pem_input)
+            if not hasattr(self.pem, 'input'):
+                self.pem.input = self.pem_input
 
         else:
             self.pem = None
@@ -576,7 +677,7 @@ class flow_sim2seis(flow):
             self.dyn_var = []
             vintage = []
             # loop over seismic vintages
-            for v, assim_time in enumerate(self.pem_input['vintage']):
+            for v, assim_time in enumerate(self.pem.input['vintage']):
                 time = dt.datetime(self.startDate['year'], self.startDate['month'], self.startDate['day']) + \
                         dt.timedelta(days=assim_time)
 
@@ -611,9 +712,9 @@ class flow_sim2seis(flow):
             # Loop over all keys in pred_data (all data types)
             for key in self.all_data_types:
                 if key in ['sim2seis']:
-                    if self.true_prim[1][prim_ind] in self.pem_input['vintage']:
+                    if self.true_prim[1][prim_ind] in self.pem.input['vintage']:
                         result = mat73.loadmat(f'En_{member}/Data_conv.mat')['data_conv']
-                        v = self.pem_input['vintage'].index(self.true_prim[1][prim_ind])
+                        v = self.pem.input['vintage'].index(self.true_prim[1][prim_ind])
                         self.pred_data[prim_ind][key] = np.sum(
                             np.abs(result[:, :, :, v]), axis=0).flatten()
 
@@ -685,6 +786,8 @@ class flow_barycenter(flow):
                           self.pem_input['model'].split()[0]), self.pem_input['model'].split()[1])
 
             self.pem = pem(self.pem_input)
+            if not hasattr(self.pem, 'input'):
+                self.pem.input = self.pem_input
 
         else:
             self.pem = None
@@ -712,13 +815,13 @@ class flow_barycenter(flow):
             if 'WAT' in phases and 'GAS' in phases:
                 vintage = []
                 # loop over seismic vintages
-                for v, assim_time in enumerate(self.pem_input['vintage']):
+                for v, assim_time in enumerate(self.pem.input['vintage']):
                     time = dt.datetime(self.startDate['year'], self.startDate['month'], self.startDate['day']) + \
                         dt.timedelta(days=assim_time)
                     pem_input = {}
                     # get active porosity
                     tmp = self.ecl_case.cell_data('PORO')
-                    if 'compaction' in self.pem_input:
+                    if 'compaction' in self.pem.input:
                         multfactor = self.ecl_case.cell_data('PORV_RC', time)
 
                         pem_input['PORO'] = np.array(
@@ -726,8 +829,8 @@ class flow_barycenter(flow):
                     else:
                         pem_input['PORO'] = np.array(tmp[~tmp.mask], dtype=float)
                     # get active NTG if needed
-                    if 'ntg' in self.pem_input:
-                        if self.pem_input['ntg'] == 'no':
+                    if 'ntg' in self.pem.input:
+                        if self.pem.input['ntg'] == 'no':
                             pem_input['NTG'] = None
                         else:
                             tmp = self.ecl_case.cell_data('NTG')
@@ -745,9 +848,9 @@ class flow_barycenter(flow):
                         # only active, and conv. to float
                         pem_input[var] = np.array(tmp[~tmp.mask], dtype=float)
 
-                    if 'press_conv' in self.pem_input:
+                    if 'press_conv' in self.pem.input:
                         pem_input['PRESSURE'] = pem_input['PRESSURE'] * \
-                            self.pem_input['press_conv']
+                            self.pem.input['press_conv']
 
                     tmp = self.ecl_case.cell_data('PRESSURE', 1)
                     if hasattr(self.pem, 'p_init'):
@@ -756,8 +859,8 @@ class flow_barycenter(flow):
                         # initial pressure is first
                         P_init = np.array(tmp[~tmp.mask], dtype=float)
 
-                    if 'press_conv' in self.pem_input:
-                        P_init = P_init*self.pem_input['press_conv']
+                    if 'press_conv' in self.pem.input:
+                        P_init = P_init*self.pem.input['press_conv']
 
                     saturations = [1 - (pem_input['SWAT'] + pem_input['SGAS']) if ph == 'OIL' else pem_input['S{}'.format(ph)]
                                    for ph in phases]
@@ -781,7 +884,7 @@ class flow_barycenter(flow):
                 # get active porosity
                 tmp = self.ecl_case.cell_data('PORO')
 
-                if 'compaction' in self.pem_input:
+                if 'compaction' in self.pem.input:
                     multfactor = self.ecl_case.cell_data('PORV_RC', base_time)
 
                     pem_input['PORO'] = np.array(
@@ -798,9 +901,9 @@ class flow_barycenter(flow):
                     # only active, and conv. to float
                     pem_input[var] = np.array(tmp[~tmp.mask], dtype=float)
 
-                if 'press_conv' in self.pem_input:
+                if 'press_conv' in self.pem.input:
                     pem_input['PRESSURE'] = pem_input['PRESSURE'] * \
-                        self.pem_input['press_conv']
+                        self.pem.input['press_conv']
 
                 saturations = [1 - (pem_input['SWAT'] + pem_input['SGAS']) if ph == 'OIL' else pem_input['S{}'.format(ph)]
                                for ph in phases]
@@ -828,8 +931,8 @@ class flow_barycenter(flow):
                     self.pem_result.append(elem)
 
             #  Extract k-means centers and interias for each element in pem_result
-            if 'clusters' in self.pem_input:
-                npzfile = np.load(self.pem_input['clusters'], allow_pickle=True)
+            if 'clusters' in self.pem.input:
+                npzfile = np.load(self.pem.input['clusters'], allow_pickle=True)
                 n_clusters_list = npzfile['n_clusters_list']
                 npzfile.close()
             else:
@@ -856,8 +959,8 @@ class flow_barycenter(flow):
             # Loop over all keys in pred_data (all data types)
             for key in self.all_data_types:
                 if key in ['barycenter']:
-                    if self.true_prim[1][prim_ind] in self.pem_input['vintage']:
-                        v = self.pem_input['vintage'].index(self.true_prim[1][prim_ind])
+                    if self.true_prim[1][prim_ind] in self.pem.input['vintage']:
+                        v = self.pem.input['vintage'].index(self.true_prim[1][prim_ind])
                         self.pred_data[prim_ind][key] = self.bar_result[v].flatten()
 
 class flow_avo(flow_rock, mixIn_multi_data):
@@ -915,10 +1018,58 @@ class flow_avo(flow_rock, mixIn_multi_data):
 
         return success
 
+    @staticmethod
+    def _normalize_roi_xy_to_grid(mask_xy, grid_shape_xy):
+        """Return ROI mask in the grid-native (nx, ny) orientation."""
+        mask_xy = np.asarray(mask_xy).astype(bool)
+        nx, ny = grid_shape_xy
+        if mask_xy.shape == (nx, ny):
+            return mask_xy
+        if mask_xy.shape == (ny, nx):
+            return mask_xy.T
+        raise ValueError(
+            f"ROI mask shape {mask_xy.shape} does not match grid shape {(nx, ny)} or {(ny, nx)}."
+        )
+
+    @staticmethod
+    def _align_grid_xy_to_avo(mask_xy, avo_shape, active_xy_yx=None):
+        """Align a grid-native (nx, ny) mask with the actual AVO layout."""
+        mask_xy = np.asarray(mask_xy).astype(bool)
+
+        if active_xy_yx is not None:
+            if mask_xy.T.shape != active_xy_yx.shape:
+                raise ValueError(
+                    f"ROI mask/grid shape {mask_xy.shape} is incompatible with active-cell layout {active_xy_yx.shape}."
+                )
+            roi_active = mask_xy.T[active_xy_yx]
+            if len(avo_shape) == 2:
+                return np.repeat(roi_active[:, np.newaxis], avo_shape[1], axis=1)
+            if len(avo_shape) == 3:
+                roi_mask = np.repeat(roi_active[:, np.newaxis], avo_shape[1], axis=1)
+                return np.repeat(roi_mask[:, :, np.newaxis], avo_shape[2], axis=2)
+            raise ValueError(f"Unsupported active-cell AVO shape {avo_shape}.")
+
+        target_xy = tuple(avo_shape[:2])
+        if mask_xy.shape == target_xy:
+            aligned_xy = mask_xy
+        elif mask_xy.T.shape == target_xy:
+            aligned_xy = mask_xy.T
+        else:
+            raise ValueError(
+                f"Could not align ROI mask shape {mask_xy.shape} with AVO xy-shape {target_xy}."
+            )
+
+        if len(avo_shape) == 2:
+            return aligned_xy
+        roi_mask = np.repeat(aligned_xy[:, :, np.newaxis], avo_shape[2], axis=2)
+        if len(avo_shape) == 4:
+            roi_mask = np.repeat(roi_mask[:, :, :, np.newaxis], avo_shape[3], axis=3)
+        return roi_mask
+
     def get_avo_result(self, folder, save_folder):
 
         if self.no_flow:
-            grid_file = self.pem_input['grid']
+            grid_file = self.pem.input['grid']
             grid = np.load(grid_file)
             zcorn = grid['ZCORN']
             dz = np.diff(zcorn[:, 0, :, 0, :, 0], axis=0)
@@ -945,9 +1096,250 @@ class flow_avo(flow_rock, mixIn_multi_data):
         #f_dim = [self.NZ, self.NY, self.NX]
         # phases = self.ecl_case.init.phases
         self.dyn_var = []
-        # coarsening of avo data - should be given as input in pipt
-        step_x = 1
-        step_y = 1
+        # Optional spatial downsampling from AVO config.
+        step_x = int(self.avo_config.get('step_x', 1))
+        step_y = int(self.avo_config.get('step_y', 1))
+        if step_x < 1 or step_y < 1:
+            raise ValueError(f"Invalid AVO sampling steps: step_x={step_x}, step_y={step_y}. Both must be >= 1.")
+
+        baseline_mode = str(self.avo_config.get('baseline_mode', 'fixed')).lower()
+
+        def _build_active_mask(actnum, avo_shape):
+            """Build an active-trace mask aligned with the first 2 AVO axes."""
+            actnum = np.asarray(actnum).astype(bool)
+            target_xy = tuple(avo_shape[:2])
+
+            # Active-cell layout: avo_shape[0] is number of active XY traces and
+            # avo_shape[1] is time. In this case data are already restricted to
+            # active traces, so active mask is all True.
+            if actnum.ndim == 3:
+                active_xy_yx = np.any(actnum, axis=0)  # (ny, nx) for ACTNUM=(nz,ny,nx)
+                n_active_xy = int(np.sum(active_xy_yx))
+                if len(avo_shape) >= 2 and avo_shape[0] == n_active_xy and avo_shape[1] != actnum.shape[1]:
+                    return np.ones(avo_shape, dtype=bool)
+
+            active_xy = None
+            for ax in range(actnum.ndim):
+                reduced = np.any(actnum, axis=ax)
+                if reduced.shape == target_xy:
+                    active_xy = reduced
+                    break
+                if reduced.ndim == 2 and reduced.T.shape == target_xy:
+                    active_xy = reduced.T
+                    break
+
+            if active_xy is None:
+                raise ValueError(
+                    f"Could not align ACTNUM shape {actnum.shape} with AVO xy-shape {target_xy}."
+                )
+
+            active_mask = np.repeat(active_xy[:, :, np.newaxis], avo_shape[2], axis=2)
+            if len(avo_shape) == 4:
+                active_mask = np.repeat(active_mask[:, :, :, np.newaxis], avo_shape[3], axis=3)
+            return active_mask
+
+        def _get_grid_coordinates(grid):
+             """Extract grid corner coordinates and compute cell centers."""
+             coord = grid['COORD']
+
+             # Assuming COORD shape is (nx+1, ny+1, ..., ...) for ECLIPSE format
+             nx = coord.shape[0] - 1
+             ny = coord.shape[1] - 1
+
+             # Compute cell center coordinates by averaging corner coordinates.
+             x_centers = np.zeros((nx, ny))
+             y_centers = np.zeros((nx, ny))
+
+             for i in range(nx):
+                 for j in range(ny):
+                     x_centers[i, j] = 0.25 * (
+                         coord[i, j, 0, 0] + coord[i + 1, j, 0, 0] +
+                         coord[i, j + 1, 0, 0] + coord[i + 1, j + 1, 0, 0]
+                     )
+                     y_centers[i, j] = 0.25 * (
+                         coord[i, j, 0, 1] + coord[i + 1, j, 0, 1] +
+                         coord[i, j + 1, 0, 1] + coord[i + 1, j + 1, 0, 1]
+                     )
+
+             return x_centers, y_centers
+
+        def _load_completion_ij(data_file):
+             """Read COMPDAT completion I/J pairs (0-based) from a DATA deck."""
+             if not os.path.exists(data_file):
+                 return []
+             out = []
+             section = None
+             with open(data_file, 'r', errors='ignore') as fh:
+                 for raw in fh:
+                     line = raw.strip()
+                     if not line or line.startswith('--'):
+                         continue
+                     up = line.upper()
+                     if up.startswith('COMPDAT'):
+                         section = 'COMPDAT'
+                         continue
+                     if line == '/':
+                         section = None
+                         continue
+                     if section != 'COMPDAT':
+                         continue
+                     toks = line.replace('/', ' ').strip().split()
+                     if len(toks) < 3:
+                         continue
+                     try:
+                         out.append((int(toks[1]) - 1, int(toks[2]) - 1))
+                     except ValueError:
+                         continue
+             return out
+        
+        def _build_roi_mask(avo_cube):
+             """Build optional ROI mask for assimilation.
+
+             Modes (avo.roi_mode):
+               - "none": keep all traces
+               - "file": use roi_mask_file only
+               - "ellipse" / "rectangle": connected ROI around well completions + strong AVO signal
+             """
+             avo_shape = np.shape(avo_cube)
+             coord = grid['COORD']
+             actnum = grid['ACTNUM']
+             
+             # Get grid dimensions and coordinates
+             nx = coord.shape[0] - 1
+             ny = coord.shape[1] - 1
+             x_grid, y_grid = _get_grid_coordinates(grid)
+
+             # Detect whether grids are laid out as [row=y, col=x].
+             def _med_abs_diff(a, axis):
+                 d = np.diff(a, axis=axis)
+                 d = d[np.isfinite(d)]
+                 return float(np.median(np.abs(d))) if d.size else 0.0
+
+             vx0 = _med_abs_diff(x_grid, 0)
+             vx1 = _med_abs_diff(x_grid, 1)
+             vy0 = _med_abs_diff(y_grid, 0)
+             vy1 = _med_abs_diff(y_grid, 1)
+             use_ji = (vx1 + vy0) > (vx0 + vy1)
+             
+             # Detect active-cell layout and recover grid-space NX/NY from ACTNUM.
+             active_cell_layout = False
+             active_xy_yx = None
+             if np.asarray(grid['ACTNUM']).ndim == 3:
+                 actnum_bool = np.asarray(grid['ACTNUM']).astype(bool)
+                 active_xy_yx = np.any(actnum_bool, axis=0)  # (ny, nx)
+                 n_active_xy = int(np.sum(active_xy_yx))
+                 if len(avo_shape) >= 2 and avo_shape[0] == n_active_xy and avo_shape[1] != actnum.shape[1]:
+                     active_cell_layout = True
+
+             roi_mode = str(self.avo_config.get('roi_mode', 'ellipse')).lower()
+             margin_m = float(self.avo_config.get('roi_margin_m', 500.0))
+             signal_pct = float(self.avo_config.get('roi_signal_percentile', 85.0))
+             use_signal = bool(self.avo_config.get('roi_use_signal', False))
+
+             # Default: keep all traces if ROI is disabled.
+             roi_xy = np.ones((nx, ny), dtype=bool)
+
+             if roi_mode not in ('none', 'off', 'all'):
+                 # Build seed points from well completions.
+                 data_path = folder + os.sep + self.file + '.DATA' if folder[-1] != os.sep else folder + self.file + '.DATA'
+                 completion_ij = _load_completion_ij(data_path)
+                 seed_x = []
+                 seed_y = []
+                 for i_idx, j_idx in completion_ij:
+                     if use_ji:
+                         if 0 <= j_idx < nx and 0 <= i_idx < ny:
+                             seed_x.append(float(x_grid[j_idx, i_idx]))
+                             seed_y.append(float(y_grid[j_idx, i_idx]))
+                     else:
+                         if 0 <= i_idx < nx and 0 <= j_idx < ny:
+                             seed_x.append(float(x_grid[i_idx, j_idx]))
+                             seed_y.append(float(y_grid[i_idx, j_idx]))
+
+                 # Add strong AVO-signal points so ROI follows saturation-change-sensitive area.
+                 if use_signal and np.ndim(avo_cube) >= 3:
+                     dyn = np.nanpercentile(np.abs(avo_cube), 95.0, axis=tuple(range(2, np.ndim(avo_cube))))
+                     dyn = np.asarray(dyn, dtype=float)
+                     if dyn.shape == (nx, ny) and np.any(np.isfinite(dyn)):
+                         thr = np.nanpercentile(dyn[np.isfinite(dyn)], signal_pct)
+                         ii, jj = np.where(dyn >= thr)
+                         for a, b in zip(ii, jj):
+                             seed_x.append(float(x_grid[a, b]))
+                             seed_y.append(float(y_grid[a, b]))
+
+                 # Fallback to active grid envelope if seeds are sparse.
+                 if len(seed_x) < 2:
+                     actnum_bool = np.asarray(actnum).astype(bool)
+                     active_indices = np.where(np.any(actnum_bool, axis=0))
+                     if len(active_indices[0]) > 0:
+                         seed_x.extend(list(np.asarray(x_grid[active_indices], dtype=float).reshape(-1)))
+                         seed_y.extend(list(np.asarray(y_grid[active_indices], dtype=float).reshape(-1)))
+
+                 x_range = self.avo_config.get('x_range', None)
+                 y_range = self.avo_config.get('y_range', None)
+                 if x_range is not None and isinstance(x_range, list) and len(x_range) == 2:
+                     x_min = float(min(x_range[0], x_range[1]))
+                     x_max = float(max(x_range[0], x_range[1]))
+                 elif seed_x:
+                     x_min = float(np.min(seed_x))
+                     x_max = float(np.max(seed_x))
+                 else:
+                     x_min = float(np.min(x_grid))
+                     x_max = float(np.max(x_grid))
+
+                 if y_range is not None and isinstance(y_range, list) and len(y_range) == 2:
+                     y_min = float(min(y_range[0], y_range[1]))
+                     y_max = float(max(y_range[0], y_range[1]))
+                 elif seed_y:
+                     y_min = float(np.min(seed_y))
+                     y_max = float(np.max(seed_y))
+                 else:
+                     y_min = float(np.min(y_grid))
+                     y_max = float(np.max(y_grid))
+
+                 if roi_mode == 'rectangle':
+                     roi_xy = (
+                         (x_grid >= (x_min - margin_m)) & (x_grid <= (x_max + margin_m)) &
+                         (y_grid >= (y_min - margin_m)) & (y_grid <= (y_max + margin_m))
+                     )
+                 elif roi_mode in ('ellipse', 'auto'):
+                     x_center = 0.5 * (x_min + x_max)
+                     y_center = 0.5 * (y_min + y_max)
+                     x_radius = max(1.0, 0.5 * (x_max - x_min) + margin_m)
+                     y_radius = max(1.0, 0.5 * (y_max - y_min) + margin_m)
+                     dx = (x_grid - x_center) / x_radius
+                     dy = (y_grid - y_center) / y_radius
+                     roi_xy = (dx * dx + dy * dy) <= 1.0
+
+             # Optional mask file overrides mask if provided.
+             roi_mask_file = self.avo_config.get('roi_mask_file', None)
+             if roi_mode == 'file' and roi_mask_file is not None:
+                 with np.load(roi_mask_file, allow_pickle=True) as f:
+                     key = 'mask' if 'mask' in f.files else f.files[0]
+                     roi_xy = self._normalize_roi_xy_to_grid(f[key], (nx, ny))
+
+             roi_mask = self._align_grid_xy_to_avo(
+                 roi_xy,
+                 avo_shape,
+                 active_xy_yx=active_xy_yx if active_cell_layout else None,
+             )
+
+             # Save coordinate system for plotting (always available from grid)
+             self.x_grid_centers = x_grid
+             self.y_grid_centers = y_grid
+
+             return roi_mask
+
+        def _save_wavelet_mask(mask, vintage_idx):
+             """Save compress-ready 3D mask that matches current AVO vectorization."""
+             mask = np.asarray(mask, dtype=bool)
+             if mask.ndim == 4:
+                 nx, ny, nt, n_ang = mask.shape
+                 mask_3d = mask.reshape(nx, ny, nt * n_ang)
+             elif mask.ndim == 3:
+                 mask_3d = mask
+             else:
+                 return
+             np.savez(f'mask_{vintage_idx}_3d.npz', mask=mask_3d)
         if 'baseline' in self.pem_input:  # 4D measurement
             base_time = dt.datetime(self.startDate['year'], self.startDate['month'],
                                     self.startDate['day']) + dt.timedelta(days=self.pem_input['baseline'])
@@ -963,18 +1355,38 @@ class flow_avo(flow_rock, mixIn_multi_data):
 
                 # avo data
                 # self._calc_avo_props()
-                avo_data_baseline, Rpp_baseline, vp_baseline, vs_baseline = self._calc_avo_props_active_cells(grid, vp, vs, rho, dz, zcorn)
-                kept_data = avo_data_baseline[::step_x, ::step_y, :].copy()
-                avo_data_baseline[:] = np.nan
-                avo_data_baseline[::step_x, ::step_y, :] = kept_data
-                avo_baseline = avo_data_baseline.flatten(order="C")
-                avo_baseline = avo_baseline[~np.isnan(avo_baseline)]
+                avo_data_baseline, Rpp_baseline, vp_baseline, vs_baseline, _ = self._calc_avo_props_active_cells(grid, vp, vs, rho, dz, zcorn)
+                if avo_data_baseline.ndim >= 3 and avo_data_baseline.shape[0] == self.NY and avo_data_baseline.shape[1] == self.NX:
+                    kept_data = avo_data_baseline[::step_x, ::step_y, :].copy()
+                    avo_data_baseline[:] = np.nan
+                    avo_data_baseline[::step_x, ::step_y, :] = kept_data
+                    baseline_sample_mask = np.zeros(np.shape(avo_data_baseline), dtype=bool)
+                    baseline_sample_mask[::step_x, ::step_y, :] = True
+                else:
+                    baseline_sample_mask = np.ones(np.shape(avo_data_baseline), dtype=bool)
+                baseline_active_mask = _build_active_mask(grid['ACTNUM'], avo_data_baseline.shape)
+                baseline_roi_mask = _build_roi_mask(avo_data_baseline)
+                baseline_structural_mask = np.logical_and(
+                    np.logical_and(baseline_active_mask, baseline_sample_mask),
+                    baseline_roi_mask
+                )
+                if not np.any(baseline_structural_mask):
+                    raise ValueError("Baseline AVO mask is empty; check ACTNUM orientation and AVO geometry.")
                 #rho_baseline = rho_sample
                 tmp = self._get_pem_input('PRESSURE', base_time)
                 PRESSURE_baseline = np.array(tmp[~tmp.mask], dtype=float)
                 tmp = self._get_pem_input('SGAS', base_time)
                 SGAS_baseline = np.array(tmp[~tmp.mask], dtype=float)
-                print('OPM flow is used')
+
+                # Rolling baseline starts at configured baseline and advances per vintage.
+                rolling_ref_avo_data = avo_data_baseline
+                rolling_ref_Rpp = Rpp_baseline
+                rolling_ref_vs = vs_baseline
+                rolling_ref_vp = vp_baseline
+                rolling_ref_PRESSURE = PRESSURE_baseline
+                rolling_ref_SGAS = SGAS_baseline
+                rolling_ref_structural_mask = baseline_structural_mask
+
             else:
                 file_name = f"avo_vint0_{folder}.npz" if folder[-1] != os.sep \
                     else f"avo_vint0_{folder[:-1]}.npz"
@@ -989,7 +1401,7 @@ class flow_avo(flow_rock, mixIn_multi_data):
         # loop over seismic vintages
         for v, assim_time in enumerate(self.pem_input['vintage']):
             time = dt.datetime(self.startDate['year'], self.startDate['month'], self.startDate['day']) + \
-                dt.timedelta(days=assim_time)
+                   dt.timedelta(days=assim_time)
 
             # extract dynamic variables from simulation run
             self.calc_pem(time, v+1)
@@ -999,17 +1411,30 @@ class flow_avo(flow_rock, mixIn_multi_data):
 
             # avo data
             #self._calc_avo_props()
-            avo_data, Rpp, vp_sample, vs_sample = self._calc_avo_props_active_cells(grid, vp, vs, rho, dz, zcorn)
+            avo_data, Rpp, vp_sample, vs_sample, _ = self._calc_avo_props_active_cells(grid, vp, vs, rho, dz, zcorn)
             #avo_data = avo_data[::step_x, ::step_y, :]
             # make mask for wavelet decomposition
-            kept_data = avo_data[::step_x, ::step_y, :].copy()
-            avo_data[:] = np.nan
-            avo_data[::step_x, ::step_y, :] = kept_data
-            mask = np.ones(np.shape(avo_data), dtype=bool)
-            mask[np.isnan(avo_data)]=False
+            if avo_data.ndim >= 3 and avo_data.shape[0] == self.NY and avo_data.shape[1] == self.NX:
+                kept_data = avo_data[::step_x, ::step_y, :].copy()
+                avo_data[:] = np.nan
+                avo_data[::step_x, ::step_y, :] = kept_data
+                sample_mask = np.zeros(np.shape(avo_data), dtype=bool)
+                sample_mask[::step_x, ::step_y, :] = True
+            else:
+                sample_mask = np.ones(np.shape(avo_data), dtype=bool)
+            active_mask = _build_active_mask(grid['ACTNUM'], avo_data.shape)
+            roi_mask = _build_roi_mask(avo_data)
+            mask = np.logical_and(
+                np.logical_and(active_mask, sample_mask),
+                roi_mask
+            )
+            if not np.any(mask):
+                raise ValueError("AVO mask is empty; check ACTNUM orientation and AVO geometry.")
             np.savez(f'mask_{v}.npz', mask=mask)
-            avo = avo_data.flatten(order="C")
-            avo = avo[~np.isnan(avo)]
+            _save_wavelet_mask(mask, v)
+            avo = np.where(np.isfinite(avo_data), avo_data, 0.0)[mask]
+            if avo.size == 0:
+                raise ValueError("AVO data selection is empty after masking.")
 
             tmp = self._get_pem_input('PRESSURE', time)
             PRESSURE = np.array(tmp[~tmp.mask], dtype=float)
@@ -1019,22 +1444,51 @@ class flow_avo(flow_rock, mixIn_multi_data):
 
             # MLIE: implement 4D avo
             if 'baseline' in self.pem_input:  # 4D measurement
-                avo = avo - avo_baseline
-                Rpp = Rpp - Rpp_baseline
-                vs_sample = vs_sample - vs_baseline
-                vp_sample = vp_sample - vp_baseline
-                PRESSURE = PRESSURE - PRESSURE_baseline
-                SGAS = SGAS - SGAS_baseline
-                #rho = self.rho_sample - rho_baseline
-                print('Time-lapse avo')
-            #else:
-            #    Rpp = self.Rpp
-            #    Vs = self.vs_sample
-            #    Vp = self.vp_sample
-            #    rho = self.rho_sample
+                if baseline_mode == 'rolling':
+                    ref_avo_data = rolling_ref_avo_data
+                    ref_Rpp = rolling_ref_Rpp
+                    ref_vs = rolling_ref_vs
+                    ref_vp = rolling_ref_vp
+                    ref_PRESSURE = rolling_ref_PRESSURE
+                    ref_SGAS = rolling_ref_SGAS
+                    ref_structural_mask = rolling_ref_structural_mask
+                else:
+                    ref_avo_data = avo_data_baseline
+                    ref_Rpp = Rpp_baseline
+                    ref_vs = vs_baseline
+                    ref_vp = vp_baseline
+                    ref_PRESSURE = PRESSURE_baseline
+                    ref_SGAS = SGAS_baseline
+                    ref_structural_mask = baseline_structural_mask
 
+                if avo_data.shape != ref_avo_data.shape:
+                    raise ValueError(
+                        f"Baseline/current AVO cube shapes differ: {avo_data.shape} vs {ref_avo_data.shape}."
+                    )
+                delta_avo = avo_data - ref_avo_data
+                delta_avo = np.where(np.isfinite(delta_avo), delta_avo, 0.0)
+                valid_mask = np.logical_and(mask, ref_structural_mask)
+                if not np.any(valid_mask):
+                    raise ValueError("4D AVO valid mask is empty after intersecting baseline and vintage masks.")
+                avo = delta_avo[valid_mask]
+                if avo.size == 0:
+                    raise ValueError("4D AVO selection is empty after baseline subtraction and masking.")
+                Rpp = Rpp - ref_Rpp
+                vs_sample = vs_sample - ref_vs
+                vp_sample = vp_sample - ref_vp
+                PRESSURE = PRESSURE - ref_PRESSURE
+                SGAS = SGAS - ref_SGAS
 
+                if baseline_mode == 'rolling':
+                    rolling_ref_avo_data = np.copy(avo_data)
+                    rolling_ref_Rpp = np.copy(Rpp + ref_Rpp)
+                    rolling_ref_vs = np.copy(vs_sample + ref_vs)
+                    rolling_ref_vp = np.copy(vp_sample + ref_vp)
+                    rolling_ref_PRESSURE = np.copy(PRESSURE + ref_PRESSURE)
+                    rolling_ref_SGAS = np.copy(SGAS + ref_SGAS)
+                    rolling_ref_structural_mask = np.copy(mask)
 
+            
             # XLUO: self.ensemble_member < 0 => reference reservoir model in synthetic case studies
             # the corresonding (noisy) data are observations in data assimilation
             if 'add_synthetic_noise' in self.input_dict and self.ensemble_member < 0:
@@ -1048,14 +1502,19 @@ class flow_avo(flow_rock, mixIn_multi_data):
 
             vintage.append(deepcopy(avo))
 
+            # Add spatial coordinates to save dict if available
+            coord_data = {}
+            if hasattr(self, 'x_grid_centers') and hasattr(self, 'y_grid_centers'):
+                coord_data = {'x_grid': self.x_grid_centers, 'y_grid': self.y_grid_centers}
+            
             if v == 0:
-                save_dic = {'avo': avo, 'noise_std': noise_std, 'Rpp': Rpp, 'Vs': vs_sample, 'Vp': vp_sample, 'PRESSURE': PRESSURE, 'SGAS': SGAS, **self.avo_config}
+                save_dic = {'avo': avo, 'noise_std': noise_std, 'Rpp': Rpp, 'Vs': vs_sample, 'Vp': vp_sample, 'PRESSURE': PRESSURE, 'SGAS': SGAS, 'base_time': base_time, **self.avo_config, **self.pem_input, **coord_data}
                 #save_dic = {'avo': avo, 'noise_std': noise_std, 'Rpp': Rpp, 'Vs': vs_sample, 'Vp': vp_sample, 'rho': rho_sample, #**self.avo_config,
                 #        'Vs_bl': vs_baseline, 'Vp_bl': vp_baseline, 'avo_bl': avo_baseline, 'Rpp_bl': Rpp_baseline, 'rho_bl': rho_baseline, **self.avo_config}
                 #save_dic = {'avo': avo, 'noise_std': noise_std, 'Rpp': Rpp, 'Vs': vs_sample, 'Vp': vp_sample,
                 #            **self.avo_config}
             else:
-                save_dic = {'avo': avo, 'noise_std': noise_std, 'Rpp': Rpp, 'Vs': vs_sample, 'Vp': vp_sample, 'PRESSURE': PRESSURE, 'SGAS': SGAS}#, 'Rpp': Rpp, 'Vs': vs_sample, 'Vp': vp_sample,
+                save_dic = {'avo': avo, 'noise_std': noise_std, 'Rpp': Rpp, 'Vs': vs_sample, 'Vp': vp_sample, 'PRESSURE': PRESSURE, 'SGAS': SGAS, **coord_data}#, 'Rpp': Rpp, 'Vs': vs_sample, 'Vp': vp_sample,
                             #'rho': rho_sample,  **self.avo_config}
 
             if save_folder is not None:
@@ -1065,9 +1524,9 @@ class flow_avo(flow_rock, mixIn_multi_data):
             else:
                 file_name = folder + os.sep + f"avo_vint{v}.npz" if folder[-1] != os.sep \
                     else folder + f"avo_vint{v}.npz"
-                file_name_rec = 'Ensemble_results/' + f"avo_vint{v}_{folder}.npz" if folder[-1] != os.sep \
-                    else 'Ensemble_results/' + f"avo_vint{v}_{folder[:-1]}.npz"
-                np.savez(file_name_rec, **save_dic)
+                #file_name_rec = 'Ensemble_results/' + f"avo_vint{v}_{folder}.npz" if folder[-1] != os.sep \
+                #    else 'Ensemble_results/' + f"avo_vint{v}_{folder[:-1]}.npz"
+                #np.savez(file_name_rec, **save_dic)
                 # with open(file_name, "wb") as f:
                 #    dump(**save_dic, f)
             np.savez(file_name, **save_dic)
@@ -1138,46 +1597,86 @@ class flow_avo(flow_rock, mixIn_multi_data):
             # Loop over all keys in pred_data (all data types)
             for key in self.all_data_types:
                 if 'avo' in key:
-                    if self.true_prim[1][prim_ind] in self.pem_input['vintage']:
-                        idx = self.pem_input['vintage'].index(self.true_prim[1][prim_ind])
-                        filename = self.folder + os.sep + key + '_vint' + str(idx) + '.npz' if self.folder[-1] != os.sep \
-                            else self.folder + key + '_vint' + str(idx) + '.npz'
-                        with np.load(filename) as f:
-                            self.pred_data[prim_ind][key] = f[key]
-                        #
-                        #v = self.pem_input['vintage'].index(self.true_prim[1][prim_ind])
-                        #self.pred_data[prim_ind][key] = self.avo_result[v].flatten()
+                    if self.true_prim[1][prim_ind] in self.pem.input['vintage']:
+                        idx = self.pem.input['vintage'].index(self.true_prim[1][prim_ind])
+                        self.pred_data[prim_ind][key] = self.avo_result[idx].flatten()
 
     def _get_avo_info(self, avo_config=None):
-        """
-        AVO configuration
-        """
-        # list of configuration parameters in the "AVO" section
-        config_para_list = ['dz', 'tops', 'angle', 'frequency', 'wave_len', 'vp_shale', 'vs_shale',
-                            'den_shale', 't_min', 't_max', 't_sampling', 'pp_func']
-        if 'avo' in self.input_dict:
-            self.avo_config = {}
-            for elem in self.input_dict['avo']:
-                assert elem[0] in config_para_list, f'Property {elem[0]} not supported'
-                if elem[0] == 'vintage' and not isinstance(elem[1], list):
-                    elem[1] = [elem[1]]
-                self.avo_config[elem[0]] = elem[1]
+         """
+         AVO configuration
+         """
+         # list of configuration parameters in the "AVO" section
+         config_para_list = ['dz', 'tops', 'angle', 'frequency', 'wave_len', 'vp_shale', 'vs_shale',
+                             'den_shale', 't_min', 't_max', 't_sampling', 'pp_func',
+                             'step_x', 'step_y', 'x_range', 'y_range', 'roi_mask_file', 'baseline_mode',
+                             'use_ellipse', 'roi_mode', 'roi_margin_m', 'roi_signal_percentile', 'roi_use_signal']
+         if 'avo' in self.input_dict:
+             self.avo_config = {}
+             for elem in self.input_dict['avo']:
+                 assert elem[0] in config_para_list, f'Property {elem[0]} not supported'
+                 if elem[0] == 'vintage' and not isinstance(elem[1], list):
+                     elem[1] = [elem[1]]
+                 self.avo_config[elem[0]] = elem[1]
 
-            # if only one angle is considered, convert self.avo_config['angle'] into a list, as required later
-            if isinstance(self.avo_config['angle'], float):
-                self.avo_config['angle'] = [self.avo_config['angle']]
+             # if only one angle is considered, convert self.avo_config['angle'] into a list, as required later
+             if isinstance(self.avo_config['angle'], float):
+                 self.avo_config['angle'] = [self.avo_config['angle']]
 
-            # self._get_DZ(file=self.avo_config['dz'])  # =>self.DZ
-            kw_file = {'DZ': self.avo_config['dz'], 'TOPS': self.avo_config['tops']}
-            self._get_props(kw_file)
-            self.overburden = self.pem_input['overburden']
+             # Optional AVO spatial sampling strides for x/y (default no thinning).
+             self.avo_config['step_x'] = int(self.avo_config.get('step_x', 1))
+             self.avo_config['step_y'] = int(self.avo_config.get('step_y', 1))
+             if self.avo_config['step_x'] < 1 or self.avo_config['step_y'] < 1:
+                 raise ValueError(
+                     f"Invalid AVO config: step_x={self.avo_config['step_x']}, "
+                     f"step_y={self.avo_config['step_y']}. Both must be >= 1."
+                 )
 
-            # make sure that the "pylops" package is installed
-            # See https://github.com/PyLops/pylops
-            self.pp_func = getattr(import_module('pylops.avo.avo'), self.avo_config['pp_func'])
+             # Optional baseline mode for 4D AVO: 'fixed' (legacy) or 'rolling'.
+             self.avo_config['baseline_mode'] = str(self.avo_config.get('baseline_mode', 'fixed')).lower()
+             if self.avo_config['baseline_mode'] not in ('fixed', 'rolling'):
+                 raise ValueError(
+                     f"Invalid AVO config: baseline_mode={self.avo_config['baseline_mode']}. "
+                     "Expected 'fixed' or 'rolling'."
+                 )
+             
+             # ROI selection mode used by assimilation mask builder.
+             if 'roi_mode' in self.avo_config:
+                 self.avo_config['roi_mode'] = str(self.avo_config['roi_mode']).lower()
+             else:
+                 # Backward compatibility with legacy boolean switch.
+                 use_ellipse = bool(self.avo_config.get('use_ellipse', True))
+                 self.avo_config['roi_mode'] = 'ellipse' if use_ellipse else 'none'
 
-        else:
-            self.avo_config = None
+             if self.avo_config['roi_mode'] not in ('none', 'off', 'all', 'ellipse', 'rectangle', 'file', 'auto'):
+                 raise ValueError(
+                     f"Invalid AVO config: roi_mode={self.avo_config['roi_mode']}. "
+                     "Expected one of 'ellipse', 'rectangle', 'file', 'none'."
+                 )
+
+             self.avo_config['roi_margin_m'] = float(self.avo_config.get('roi_margin_m', 500.0))
+             if self.avo_config['roi_margin_m'] < 0:
+                 raise ValueError(
+                     f"Invalid AVO config: roi_margin_m={self.avo_config['roi_margin_m']}. Must be >= 0."
+                 )
+
+             self.avo_config['roi_signal_percentile'] = float(self.avo_config.get('roi_signal_percentile', 85.0))
+             if not (0.0 <= self.avo_config['roi_signal_percentile'] <= 100.0):
+                 raise ValueError(
+                     f"Invalid AVO config: roi_signal_percentile={self.avo_config['roi_signal_percentile']}. "
+                     "Must be in [0, 100]."
+                 )
+
+             # self._get_DZ(file=self.avo_config['dz'])  # =>self.DZ
+             kw_file = {'DZ': self.avo_config['dz'], 'TOPS': self.avo_config['tops']}
+             self._get_props(kw_file)
+             self.overburden = self.pem_input['overburden']
+
+             # make sure that the "pylops" package is installed
+             # See https://github.com/PyLops/pylops
+             self.pp_func = getattr(import_module('pylops.avo.avo'), self.avo_config['pp_func'])
+
+         else:
+             self.avo_config = None
 
     def _get_props(self, kw_file):
         # extract properties (specified by keywords) in (possibly) different files
@@ -1226,26 +1725,23 @@ class flow_avo(flow_rock, mixIn_multi_data):
         top_res = 2 * self.TOPS[:, :, 0] / vp_shale
 
         # Cumulative traveling time through the reservoir in vertical direction
-        cum_time_res = np.cumsum(2 * self.DZ / self.vp, axis=2) + top_res[:, :, np.newaxis]
+        cum_time_res = np.cumsum(2 * self.DZ / self.vp, axis=0) + top_res[:, :, np.newaxis]
 
-        # assumes underburden to be constant. No reflections from underburden. Hence set traveltime to underburden very large
-        underburden = top_res + np.max(cum_time_res)
+        # assumes under burden to be constant. No reflections from under burden. Hence set travel time to under burden very large
+        underburden = top_res + np.nanmax(cum_time_res)
 
         # total travel time
         # cum_time = np.concatenate((top_res[:, :, np.newaxis], cum_time_res), axis=2)
-        cum_time = np.concatenate((top_res[:, :, np.newaxis], cum_time_res, underburden[:, :, np.newaxis]), axis=2)
+        cum_time = np.concatenate((top_res[np.newaxis, :, :], cum_time_res, underburden[np.newaxis, :, :]), axis=0)
 
 
         # add overburden and underburden of Vp, Vs and Density
-        vp = np.concatenate((vp_shale * np.ones((self.NX, self.NY, 1)),
-                             self.vp, vp_shale * np.ones((self.NX, self.NY, 1))), axis=2)
-        vs = np.concatenate((vs_shale * np.ones((self.NX, self.NY, 1)),
-                             self.vs, vs_shale * np.ones((self.NX, self.NY, 1))), axis=2)
-
-        #rho = np.concatenate((rho_shale * np.ones((self.NX, self.NY, 1)) * 0.001,  # kg/m^3 -> k/cm^3
-        #                      self.rho, rho_shale * np.ones((self.NX, self.NY, 1)) * 0.001), axis=2)
-        rho = np.concatenate((rho_shale * np.ones((self.NX, self.NY, 1)),
-                              self.rho, rho_shale * np.ones((self.NX, self.NY, 1))), axis=2)
+        vp = np.concatenate((vp_shale * np.ones((1, self.NY, self.NX)),
+                             self.vp, vp_shale * np.ones((1, self.NY, self.NX))), axis=0)
+        vs = np.concatenate((vs_shale * np.ones((1, self.NY, self.NX)),
+                             self.vs, vs_shale * np.ones((1, self.NY, self.NX))), axis=0)
+        rho = np.concatenate((rho_shale * np.ones((1, self.NY, self.NX)),
+                              self.rho, rho_shale * np.ones((1, self.NY, self.NX))), axis=0)
 
         # search for the lowest grid cell thickness and sample the time according to
         # that grid thickness to preserve the thin layer effect
@@ -1268,9 +1764,6 @@ class flow_avo(flow_rock, mixIn_multi_data):
                     vp_sample[m, l, k] = vp[m, l, idx]
                     vs_sample[m, l, k] = vs[m, l, idx]
                     rho_sample[m, l, k] = rho[m, l, idx]
-
-
-
 
         # Ricker wavelet
         wavelet, t_axis, wav_center = ricker(np.arange(0, self.avo_config['wave_len'], dt),
@@ -1363,135 +1856,6 @@ class flow_avo(flow_rock, mixIn_multi_data):
         time_sample = np.arange(self.avo_config['t_min'], self.avo_config['t_max'], dt)
         if time_sample.shape[0] == 1:
             time_sample = time_sample.reshape(-1)
-        #time_sample = np.tile(time_sample, (len(indices), 1))
-        time_sample = np.tile(time_sample, (self.NX, self.NY, 1))
-
-        #vp_sample = vp_shale * np.ones((self.NX, self.NY, time_sample.shape[2]))
-        #vs_sample = vs_shale * np.ones((self.NX, self.NY, time_sample.shape[2]))
-        #rho_sample = rho_shale * np.ones((self.NX, self.NY, time_sample.shape[2]))
-        vp_sample = np.full([self.NX, self.NY, time_sample.shape[2]], np.nan)
-        vs_sample = np.full([self.NX, self.NY, time_sample.shape[2]], np.nan)
-        rho_sample = np.full([self.NX, self.NY, time_sample.shape[2]], np.nan)
-
-
-        for ind in range(len(indices)):
-            for k in range(time_sample.shape[2]):
-                # find the right interval of time_sample[m, l, k] belonging to, and use
-                # this information to allocate vp, vs, rho
-                idx = np.searchsorted(cum_time[:, a[indices[ind]], b[indices[ind]]], time_sample[b[indices[ind]], a[indices[ind]], k], side='left')
-                idx = idx if idx < len(cum_time[:, a[indices[ind]], b[indices[ind]]]) else len(
-                    cum_time[:,a[indices[ind]], b[indices[ind]]]) - 1
-                vp_sample[b[indices[ind]], a[indices[ind]], k] = vp[idx, a[indices[ind]], b[indices[ind]]]
-                vs_sample[b[indices[ind]], a[indices[ind]], k] = vs[idx, a[indices[ind]], b[indices[ind]]]
-                rho_sample[b[indices[ind]], a[indices[ind]], k] = rho[idx, a[indices[ind]], b[indices[ind]]]
-
-        # Ricker wavelet
-        wavelet, t_axis, wav_center = ricker(np.arange(0, self.avo_config['wave_len']-dt, dt),
-                                             f0=self.avo_config['frequency'])
-
-        # Travel time corresponds to reflectivity series
-        #t = time_sample[:, 0:-1]
-        t = time_sample[:, :, 0:-1]
-
-        # interpolation time
-        t_interp = np.arange(self.avo_config['t_min'], self.avo_config['t_max'], self.avo_config['t_sampling'])
-        #trace_interp = np.zeros((len(indices), len(t_interp)))
-        #trace_interp = np.zeros((self.NX, self.NY, len(t_interp)))
-        trace_interp = np.full([self.NX, self.NY, len(t_interp)], np.nan)
-
-        # number of pp reflection coefficients in the vertical direction
-        nz_rpp = vp_sample.shape[2] - 1
-        conv_op = Convolve1D(nz_rpp, h=wavelet, offset=wav_center, dtype="float32")
-
-        avo_data = []
-        Rpp = []
-        for i in range(len(self.avo_config['angle'])):
-            angle = self.avo_config['angle'][i]
-            angle = np.atleast_1d(angle) # avoid error in avo.py
-            Rpp = self.pp_func(vp_sample[:, :, :-1], vs_sample[:, :, :-1], rho_sample[:, :, :-1],
-                               vp_sample[:, :, 1:], vs_sample[:, :, 1:], rho_sample[:, :, 1:], angle)
-
-            for ind in range(len(indices)):
-                # convolution with the Ricker wavelet
-
-                w_trace = conv_op * Rpp[b[indices[ind]], a[indices[ind]], :]
-
-                # Sample the trace into regular time interval
-                f = interp1d(np.squeeze(t[b[indices[ind]], a[indices[ind]], :]), np.squeeze(w_trace),
-                             kind='nearest', fill_value='extrapolate')
-                trace_interp[b[indices[ind]], a[indices[ind]], :] = f(t_interp)
-
-            if i == 0:
-                avo_data = trace_interp  # 3D
-            elif i == 1:
-                avo_data = np.stack((avo_data, trace_interp), axis=-1)  # 4D
-            else:
-                avo_data = np.concatenate((avo_data, trace_interp[:, :, np.newaxis]), axis=2)  # 4D
-
-        return avo_data, Rpp, vp_sample, vs_sample
-        #self.avo_data = avo_data
-        #self.Rpp = Rpp
-        #self.vp_sample = vp_sample
-        #self.vs_sample = vs_sample
-        #self.rho_sample = rho_sample
-
-
-
-    def _calc_avo_props_active_cells_org(self, grid, vp, vs, rho, dz, zcorn, dt=0.0005):
-        # dt is the fine resolution sampling rate
-        # convert properties in reservoir model to time domain
-        vp_shale = self.avo_config['vp_shale']  # scalar value (code may not work for matrix value)
-        vs_shale = self.avo_config['vs_shale']  # scalar value
-        rho_shale = self.avo_config['den_shale']  # scalar value
-
-
-        actnum = grid['ACTNUM']
-        # Find indices where the boolean array is True
-        active_indices = np.where(actnum)
-        #         #         #
-
-        # Two-way travel time tp the top of the reservoir
-
-
-        c, a, b = active_indices
-
-        # Two-way travel time tp the top of the reservoir
-        top_res = 2 * zcorn[0, 0, :, 0, :, 0] / vp_shale
-
-        # depth difference between cells in z-direction:
-        depth_differences = dz#(zcorn[:, 0, :, 0, :, 0] , axis=0)
-
-
-        # Cumulative traveling time through the reservoir in vertical direction
-         #cum_time_res = 2 * zcorn[:, 0, :, 0, :, 0] / self.vp  + top_res[np.newaxis, :, :]
-        cum_time_res = np.cumsum(2 * depth_differences / vp, axis=0) + top_res[np.newaxis, :, :]
-        # assumes under burden to be constant. No reflections from under burden. Hence set travel time to under burden very large
-        underburden = top_res + np.nanmax(cum_time_res)
-
-        # total travel time
-        # cum_time = np.concat enate((top_res[:, :, np.newaxis], cum_time_res), axis=2)
-        cum_time = np.concatenate((top_res[np.newaxis, :, :], cum_time_res, underburden[np.newaxis, :, :]), axis=0)
-
-        # add overburden and underburden values for  Vp, Vs and Density
-        vp = np.concatenate((vp_shale * np.ones((1, self.NY, self.NX)),
-                             vp, vp_shale * np.ones((1, self.NY, self.NX))), axis=0)
-        vs = np.concatenate((vs_shale * np.ones((1, self.NY, self.NX)),
-                             vs, vs_shale * np.ones((1, self.NY, self.NX))), axis=0)
-        rho = np.concatenate((rho_shale * np.ones((1, self.NY, self.NX)),
-                              rho, rho_shale * np.ones((1, self.NY, self.NX))), axis=0)
-
-
-        # Combine a and b into a 2D array (each column represents a vector)
-        ab = np.column_stack((a, b))
-
-        # Extract unique rows and get the indices of those unique rows
-        unique_rows, indices = np.unique(ab, axis=0, return_index=True)
-
-        # search for the lowest grid cell thickness and sample the time according to
-        # that grid thickness to preserve the thin layer effect
-        time_sample = np.arange(self.avo_config['t_min'], self.avo_config['t_max'], dt)
-        if time_sample.shape[0] == 1:
-            time_sample = time_sample.reshape(-1)
         time_sample = np.tile(time_sample, (len(indices), 1))
 
         vp_sample = np.zeros((len(indices), time_sample.shape[1]))
@@ -1528,6 +1892,7 @@ class flow_avo(flow_rock, mixIn_multi_data):
         Rpp = []
         for i in range(len(self.avo_config['angle'])):
             angle = self.avo_config['angle'][i]
+            angle = np.atleast_1d(angle)
             Rpp = self.pp_func(vp_sample[:, :-1], vs_sample[:, :-1], rho_sample[:, :-1],
                                vp_sample[:, 1:], vs_sample[:, 1:], rho_sample[:, 1:], angle)
 
@@ -1546,139 +1911,30 @@ class flow_avo(flow_rock, mixIn_multi_data):
             elif i == 1:
                 avo_data = np.stack((avo_data, trace_interp), axis=-1)  # 4D
             else:
-                avo_data = np.concatenate((avo_data, trace_interp[:, :, np.newaxis]), axis=2)  # 4D
-
-        return avo_data, Rpp, vp_sample, vs_sample, rho_sample
-        #self.avo_data = avo_data
-        #self.Rpp = Rpp
-        #self.vp_sample = vp_sample
-        #self.vs_sample = vs_sample
-        #self.rho_sample = rho_sample
-
-    def _calc_avo_props_active_cells_org(self, grid, dt=0.0005):
-        # dt is the fine resolution sampling rate
-        # convert properties in reservoir model to time domain
-        vp_shale = self.avo_config['vp_shale']  # scalar value (code may not work for matrix value)
-        vs_shale = self.avo_config['vs_shale']  # scalar value
-        rho_shale = self.avo_config['den_shale']  # scalar value
-
-        # check if Nz, is at axis = 0, then transpose to dimensions, Nx, ny, Nz
-        if grid['ACTNUM'].shape[0] == self.NZ:
-            vp = np.transpose(self.vp, (2, 1, 0))
-            vs = np.transpose(self.vs, (2, 1, 0))
-            rho = np.transpose(self.rho, (2, 1, 0))
-            actnum = np.transpose(grid['ACTNUM'], (2, 1, 0))
-        else:
-            actnum = grid['ACTNUM']
-            vp = self.vp
-            vs = self.vs
-            rho = self.rho
-        #         #         #
-
-        # Two-way travel time of the top of the reservoir
-        # TOPS[:, :, 0] corresponds to the depth profile of the reservoir top on the first layer
-        top_res = 2 * self.TOPS[:, :, 0] / vp_shale
-
-        # Cumulative traveling time through the reservoir in vertical direction
-        cum_time_res = np.nancumsum(2 * self.DZ / vp, axis=2) + top_res[:, :, np.newaxis]
-
-        # assumes under burden to be constant. No reflections from under burden. Hence set travel time to under burden very large
-        underburden = top_res + np.max(cum_time_res)
-
-        # total travel time
-        # cum_time = np.concatenate((top_res[:, :, np.newaxis], cum_time_res), axis=2)
-        cum_time = np.concatenate((top_res[:, :, np.newaxis], cum_time_res, underburden[:, :, np.newaxis]), axis=2)
-
-        # add overburden and underburden of Vp, Vs and Density
-        vp = np.concatenate((vp_shale * np.ones((self.NX, self.NY, 1)),
-                             vp, vp_shale * np.ones((self.NX, self.NY, 1))), axis=2)
-        vs = np.concatenate((vs_shale * np.ones((self.NX, self.NY, 1)),
-                             vs, vs_shale * np.ones((self.NX, self.NY, 1))), axis=2)
-        #rho = np.concatenate((rho_shale * np.ones((self.NX, self.NY, 1)) * 0.001,  # kg/m^3 -> k/cm^3
-        #                      self.rho, rho_shale * np.ones((self.NX, self.NY, 1)) * 0.001), axis=2)
-        rho = np.concatenate((rho_shale * np.ones((self.NX, self.NY, 1)),
-                              rho, rho_shale * np.ones((self.NX, self.NY, 1))), axis=2)
-
-        # get indices of active cells
-
-        indices = np.where(actnum)
-        a, b, c = indices
-        # Combine a and b into a 2D array (each column represents a vector)
-        ab = np.column_stack((a, b))
-
-        # Extract unique rows and get the indices of those unique rows
-        unique_rows, indices = np.unique(ab, axis=0, return_index=True)
-
-
-        # search for the lowest grid cell thickness and sample the time according to
-        # that grid thickness to preserve the thin layer effect
-        time_sample = np.arange(self.avo_config['t_min'], self.avo_config['t_max'], dt)
-        if time_sample.shape[0] == 1:
-            time_sample = time_sample.reshape(-1)
-        time_sample = np.tile(time_sample, (len(indices), 1))
-
-        vp_sample = np.zeros((len(indices), time_sample.shape[1]))
-        vs_sample = np.zeros((len(indices), time_sample.shape[1]))
-        rho_sample = np.zeros((len(indices), time_sample.shape[1]))
-
-
-        for ind in range(len(indices)):
-            for k in range(time_sample.shape[1]):
-                # find the right interval of time_sample[m, l, k] belonging to, and use
-                # this information to allocate vp, vs, rho
-                idx = np.searchsorted(cum_time[a[indices[ind]], b[indices[ind]], :], time_sample[ind, k], side='left')
-                idx = idx if idx < len(cum_time[a[indices[ind]], b[indices[ind]], :]) else len(cum_time[a[indices[ind]], b[indices[ind]], :]) - 1
-                vp_sample[ind, k] = vp[a[indices[ind]], b[indices[ind]], idx]
-                vs_sample[ind, k] = vs[a[indices[ind]], b[indices[ind]], idx]
-                rho_sample[ind, k] = rho[a[indices[ind]], b[indices[ind]], idx]
-
-
-        # Ricker wavelet
-        wavelet, t_axis, wav_center = ricker(np.arange(0, self.avo_config['wave_len'], dt),
-                                             f0=self.avo_config['frequency'])
-
-        # Travel time corresponds to reflectivity series
-        t = time_sample[:, 0:-1]
-
-        # interpolation time
-        t_interp = np.arange(self.avo_config['t_min'], self.avo_config['t_max'], self.avo_config['t_sampling'])
-        trace_interp = np.zeros((len(indices), len(t_interp)))
-
-        # number of pp reflection coefficients in the vertical direction
-        nz_rpp = vp_sample.shape[1] - 1
-        conv_op = Convolve1D(nz_rpp, h=wavelet, offset=wav_center, dtype="float32")
-
-        avo_data = []
-        Rpp = []
-        for i in range(len(self.avo_config['angle'])):
-            angle = self.avo_config['angle'][i]
-            Rpp = self.pp_func(vp_sample[:, :-1], vs_sample[:, :-1], rho_sample[:, :-1],
-                           vp_sample[:, 1:], vs_sample[:, 1:], rho_sample[:, 1:], angle)
-
-
-
-            for ind in range(len(indices)):
-                # convolution with the Ricker wavelet
-
-                w_trace = conv_op * Rpp[ind, :]
-
-                # Sample the trace into regular time interval
-                f = interp1d(np.squeeze(t[ind, :]), np.squeeze(w_trace),
-                            kind='nearest', fill_value='extrapolate')
-                trace_interp[ind, :] = f(t_interp)
-
-            if i == 0:
-                avo_data = trace_interp  # 3D
-            elif i == 1:
-                avo_data = np.stack((avo_data, trace_interp), axis=-1)  # 4D
-            else:
                 avo_data = np.concatenate((avo_data, trace_interp[:, :, :, np.newaxis]), axis=3)  # 4D
 
-        self.avo_data = avo_data
-        self.Rpp = Rpp
-        self.vp_sample = vp_sample
-        self.vs_sample = vs_sample
-        self.rho_sample = rho_sample
+        # Reshape avo_data from trace format (n_traces, time, [...angles]) back to spatial grid format (ny, nx, time, [...angles])
+        # unique_rows contains (y, x) indices for each trace
+        ny = self.NY
+        nx = self.NX
+
+        if avo_data.ndim == 2:
+            # Single angle: (n_traces, time) -> (ny, nx, time)
+            avo_data_spatial = np.full((ny, nx, avo_data.shape[1]), np.nan)
+            for ind in range(len(unique_rows)):
+                y, x = unique_rows[ind]
+                avo_data_spatial[y, x, :] = avo_data[ind, :]
+            avo_data = avo_data_spatial
+        elif avo_data.ndim == 3:
+            # Multiple angles: (n_traces, time, n_angles) -> (ny, nx, time, n_angles)
+            n_angles = avo_data.shape[2]
+            avo_data_spatial = np.full((ny, nx, avo_data.shape[1], n_angles), np.nan)
+            for ind in range(len(unique_rows)):
+                y, x = unique_rows[ind]
+                avo_data_spatial[y, x, :, :] = avo_data[ind, :, :]
+            avo_data = avo_data_spatial
+
+        return avo_data, Rpp, vp_sample, vs_sample, rho_sample
 
 
     @classmethod
@@ -1725,13 +1981,13 @@ class flow_grav(flow_rock, mixIn_multi_data):
         # Then, get the pem.
         if folder is None:
             folder = self.folder
-
-        if not self.no_flow:
-            # call call_sim in flow class (skip flow_rock, go directly to flow which is a parent of flow_rock)
-            success = super(flow_rock, self).call_sim(folder, True)
         else:
-            success = True
-        #
+            self.folder = folder
+
+        # run flow  simulator
+        # success = True
+        success = super(flow_rock, self).call_sim(folder, True)
+
         # use output from flow simulator to forward model gravity response
         if success:
             self.get_grav_result(folder, save_folder)
@@ -1740,7 +1996,7 @@ class flow_grav(flow_rock, mixIn_multi_data):
 
     def get_grav_result(self, folder, save_folder):
         if self.no_flow:
-            grid_file = self.pem_input['grid']
+            grid_file = self.pem.input['grid']
             grid = np.load(grid_file)
         else:
             self.ecl_case = ecl.EclipseCase(folder + os.sep + self.file + '.DATA') if folder[-1] != os.sep \
@@ -1774,17 +2030,24 @@ class flow_grav(flow_rock, mixIn_multi_data):
 
         # loop over vintages with gravity acquisitions
         grav_struct = {}
+        baseline_mode = str(self.grav_config.get('baseline_mode', 'fixed')).lower()
+        if baseline_mode not in ('fixed', 'rolling'):
+            raise ValueError(
+                f"Invalid GRAV config: baseline_mode={baseline_mode}. Expected 'fixed' or 'rolling'."
+            )
 
         if 'baseline' in self.grav_config:  # 4D measurement
             base_time = dt.datetime(self.startDate['year'], self.startDate['month'],
                                     self.startDate['day']) + dt.timedelta(days=self.grav_config['baseline'])
             # porosity, saturation, densities, and fluid mass at time of baseline survey
-            grav_base = self.calc_mass(base_time, 0)
+            grav_base, cutoff_base = self.calc_mass(base_time, 0, cutoff_base=None)
+            rolling_base = deepcopy(grav_base)
 
 
         else:
             # seafloor gravity only works in 4D mode
             grav_base = None
+            cutoff_base = None
             print('Need to specify Baseline survey for gravity in input file')
 
         for v, assim_time in enumerate(self.grav_config['vintage']):
@@ -1792,7 +2055,7 @@ class flow_grav(flow_rock, mixIn_multi_data):
                    dt.timedelta(days=assim_time)
 
             # porosity, saturation, densities, and fluid mass at individual time-steps
-            grav_struct[v] = self.calc_mass(time, v+1)  # calculate the mass of each fluid in each grid cell
+            grav_struct[v], _ = self.calc_mass(time, v+1, cutoff_base=cutoff_base)  # calculate the mass of each fluid in each grid cell
 
 
 
@@ -1800,14 +2063,15 @@ class flow_grav(flow_rock, mixIn_multi_data):
 
 
         for v, assim_time in enumerate(self.grav_config['vintage']):
-            dg = self.calc_grav(grid, grav_base, grav_struct[v], pos)
+            base_ref = rolling_base if baseline_mode == 'rolling' else grav_base
+            dg = self.calc_grav(grid, base_ref, grav_struct[v], pos)
             vintage.append(deepcopy(dg))
 
             #save_dic = {'grav': dg, **self.grav_config}
             save_dic = {
                 'grav': dg, 'P_vint': grav_struct[v]['PRESSURE'], 'rho_gas_vint':grav_struct[v]['GAS_DEN'],
                 'meas_location': pos, **self.grav_config,
-                **{key: grav_struct[v][key] - grav_base[key] for key in grav_struct[v].keys()}
+                **{key: grav_struct[v][key] - base_ref[key] for key in grav_struct[v].keys()}
             }
             if save_folder is not None:
                 file_name = save_folder + os.sep + f"grav_vint{v}.npz" if save_folder[-1] != os.sep \
@@ -1830,9 +2094,12 @@ class flow_grav(flow_rock, mixIn_multi_data):
                 except:
                     file_name_rec = 'Ensemble_results/' + f"grav_vint{v}_{folder}.npz" if folder[-1] != os.sep \
                         else 'Ensemble_results/' + f"grav_vint{v}_{folder[:-1]}.npz"
-                np.savez(file_name_rec, **save_dic)
+                #np.savez(file_name_rec, **save_dic)
 
             np.savez(file_name, **save_dic)
+
+            if baseline_mode == 'rolling':
+                rolling_base = deepcopy(grav_struct[v])
 
 
         # 4D response
@@ -1840,22 +2107,31 @@ class flow_grav(flow_rock, mixIn_multi_data):
         for i, elem in enumerate(vintage):
             self.grav_result.append(elem)
 
-    def calc_mass(self, time, time_index = None):
+    def calc_mass(self, time, time_index = None, cutoff_base = None):
 
         if self.no_flow:
             time_input = time_index
         else:
             time_input = time
 
-        # fluid phases given as input
-        phases = str.upper(self.pem_input['phases'])
-        phases = phases.split()
+        # fluid phases given as input; accept both "WAT GAS" and ["WAT", "GAS"]
+        phases_raw = self.pem.input.get('phases', '')
+        phases = []
+        if isinstance(phases_raw, str):
+            phases = phases_raw.upper().split()
+        elif isinstance(phases_raw, (list, tuple, set, np.ndarray)):
+            for item in phases_raw:
+                phases.extend(str(item).upper().split())
+        else:
+            phases = str(phases_raw).upper().split()
         #
         grav_input = {}
         tmp_dyn_var = {}
 
 
         tmp = self._get_pem_input('RPORV', time_input)
+
+        tmp, cutoff = self.filter_rporv(tmp, cutoff = cutoff_base, method='percentile', percentile=90)
         grav_input['RPORV'] = np.array(tmp[~tmp.mask], dtype=float)
 
         tmp = self._get_pem_input('PRESSURE', time_input)
@@ -1865,8 +2141,8 @@ class flow_grav(flow_rock, mixIn_multi_data):
         #    tmp = tmp + tmp_baseline
         grav_input['PRESSURE'] = np.array(tmp[~tmp.mask], dtype=float)
         # convert pressure from Bar to MPa
-        if 'press_conv' in self.pem_input and time_input == time:
-            grav_input['PRESSURE'] = grav_input['PRESSURE'] * self.pem_input['press_conv']
+        if 'press_conv' in self.pem.input and time_input == time:
+            grav_input['PRESSURE'] = grav_input['PRESSURE'] * self.pem.input['press_conv']
         #else:
         #    print('Keyword RPORV missing from simulation output, need updated pore volumes at each assimilation step')
         # extract saturation
@@ -1941,7 +2217,7 @@ class flow_grav(flow_rock, mixIn_multi_data):
             #tmp = self.ecl_case.cell_data(dens, time)
             if self.no_flow:
                 if  any('pressure' in key for key in self.state.keys()):
-                    if 'press_conv' in self.pem_input:
+                    if 'press_conv' in self.pem.input:
                         conv2pa = 1e6 #MPa to Pa
                     else:
                         conv2pa = 1e5  # Bar to Pa
@@ -1978,7 +2254,7 @@ class flow_grav(flow_rock, mixIn_multi_data):
             mass = var + '_mass'
             grav_input[mass] = grav_input[var + '_DEN'] * grav_input['S' + var] * grav_input['RPORV']
 
-        return grav_input
+        return grav_input, cutoff
 
     def calc_grav(self, grid, grav_base, grav_repeat, pos):
 
@@ -1993,9 +2269,16 @@ class flow_grav(flow_rock, mixIn_multi_data):
         dg = np.zeros(n_meas)  # 1D array for dg
         dg[:] = np.nan
 
-        # fluid phases given as input
-        phases = str.upper(self.pem_input['phases'])
-        phases = phases.split()
+        # fluid phases given as input; accept both "WAT GAS" and ["WAT", "GAS"]
+        phases_raw = self.pem.input.get('phases', '')
+        phases = []
+        if isinstance(phases_raw, str):
+            phases = phases_raw.upper().split()
+        elif isinstance(phases_raw, (list, tuple, set, np.ndarray)):
+            for item in phases_raw:
+                phases.extend(str(item).upper().split())
+        else:
+            phases = str(phases_raw).upper().split()
         if 'OIL' in phases and 'WAT' in phases and 'GAS' in phases:
             dm  = grav_repeat['OIL_mass'] + grav_repeat['WAT_mass'] + grav_repeat['GAS_mass'] - (grav_base['OIL_mass'] + grav_base['WAT_mass'] + grav_base['GAS_mass'])
 
@@ -2003,7 +2286,7 @@ class flow_grav(flow_rock, mixIn_multi_data):
             dm = grav_repeat['OIL_mass'] + grav_repeat['GAS_mass'] - (grav_base['OIL_mass'] + grav_base['GAS_mass'])
             # dm = grav_repeat['WAT_mass'] + grav_repeat['GAS_mass'] - (grav_base['WAT_mass'] + grav_base['GAS_mass'])
 
-        elif 'WAT' in phases and 'GAS' in phases:  # Smeaheia model
+        elif 'WAT' in phases and 'GAS' in phases:  # Smeaheia or SPE11 model
             dm  = grav_repeat['WAT_mass'] + grav_repeat['GAS_mass'] - (grav_base['WAT_mass'] + grav_base['GAS_mass'])
             #dm = grav_repeat['WAT_mass'] + grav_repeat['GAS_mass'] - (grav_base['WAT_mass'] + grav_base['GAS_mass'])
 
@@ -2031,7 +2314,8 @@ class flow_grav(flow_rock, mixIn_multi_data):
         GRAV configuration
         """
         # list of configuration parameters in the "Grav" section of teh pipt file
-        config_para_list = ['baseline', 'vintage', 'water_depth', 'padding', 'meas_spacing', 'seabed', 'well_coord']
+        config_para_list = ['baseline', 'vintage', 'method', 'model', 'poisson', 'compressibility',
+                            'z_base', 'meas_spacing', 'padding', 'seabed', 'water_depth', 'well_coord', 'baseline_mode']
 
         if 'grav' in self.input_dict:
             self.grav_config = {}
@@ -2040,12 +2324,19 @@ class flow_grav(flow_rock, mixIn_multi_data):
                 if elem[0] == 'vintage' and not isinstance(elem[1], list):
                     elem[1] = [elem[1]]
                 self.grav_config[elem[0]] = elem[1]
+            self.grav_config['baseline_mode'] = str(self.grav_config.get('baseline_mode', 'fixed')).lower()
+            if self.grav_config['baseline_mode'] not in ('fixed', 'rolling'):
+                raise ValueError(
+                    f"Invalid GRAV config: baseline_mode={self.grav_config['baseline_mode']}. "
+                    "Expected 'fixed' or 'rolling'."
+                )
         else:
             self.grav_config = None
 
     def extract_data(self, member):
-        # start by getting the data from the flow simulator
+        # start by getting the data from the flow simulator i.e. prod. and inj. data
         super(flow_rock, self).extract_data(member)
+        self._recover_missing_well_summary_data(member)
 
         # get the gravity data from results
         for prim_ind in self.l_prim:
@@ -2096,7 +2387,7 @@ class flow_seafloor_disp(flow_rock, mixIn_multi_data):
 
     def get_displacement_result(self, folder, save_folder):
         if self.no_flow:
-            grid_file = self.pem_input['grid']
+            grid_file = self.pem.input['grid']
             grid = np.load(grid_file)
         else:
             self.ecl_case = ecl.EclipseCase(folder + os.sep + self.file + '.DATA') if folder[-1] != os.sep \
@@ -2123,16 +2414,23 @@ class flow_seafloor_disp(flow_rock, mixIn_multi_data):
 
         # loop over vintages with gravity acquisitions
         disp_struct = {}
+        baseline_mode = str(self.disp_config.get('baseline_mode', 'fixed')).lower()
+        if baseline_mode not in ('fixed', 'rolling'):
+            raise ValueError(
+                f"Invalid SEA_DISP config: baseline_mode={baseline_mode}. Expected 'fixed' or 'rolling'."
+            )
 
         if 'baseline' in self.disp_config:  # 4D measurement
             base_time = dt.datetime(self.startDate['year'], self.startDate['month'],
                                     self.startDate['day']) + dt.timedelta(days=self.disp_config['baseline'])
             # pore volume at time of baseline survey
-            disp_base = self.get_pore_volume(base_time, 0)
+            disp_base, cutoff_base  = self.get_pore_volume(base_time, 0)
+            rolling_base = deepcopy(disp_base)
 
         else:
             # seafloor  displacement only work in 4D mode
             disp_base = None
+            cutoff_base = None
             print('Need to specify Baseline survey for displacement modelling in input file')
 
         for v, assim_time in enumerate(self.disp_config['vintage']):
@@ -2140,13 +2438,14 @@ class flow_seafloor_disp(flow_rock, mixIn_multi_data):
                    dt.timedelta(days=assim_time)
 
             # pore volume and pressure at individual time-steps
-            disp_struct[v] = self.get_pore_volume(time, v+1)  # calculate the mass of each fluid in each grid cell
+            disp_struct[v], _ = self.get_pore_volume(time, v+1)  # calculate the mass of each fluid in each grid cell
 
         vintage = []
 
         for v, assim_time in enumerate(self.disp_config['vintage']):
             # calculate subsidence and uplift
-            dz_seafloor = self.map_z_response(disp_base, disp_struct[v], grid, pos)
+            base_ref = rolling_base if baseline_mode == 'rolling' else disp_base
+            dz_seafloor = self.map_z_response(base_ref, disp_struct[v], grid, pos)
             vintage.append(deepcopy(dz_seafloor))
 
             save_dic = {'sea_disp': dz_seafloor, 'meas_location': pos, **self.disp_config}
@@ -2162,13 +2461,16 @@ class flow_seafloor_disp(flow_rock, mixIn_multi_data):
 
             np.savez(file_name, **save_dic)
 
+            if baseline_mode == 'rolling':
+                rolling_base = deepcopy(disp_struct[v])
+
 
         # 4D response
         self.disp_result = []
         for i, elem in enumerate(vintage):
             self.disp_result.append(elem)
 
-    def get_pore_volume(self, time, time_index = None):
+    def get_pore_volume(self, time, time_index = None, cutoff_base = None):
 
         if self.no_flow:
             time_input = time_index
@@ -2181,6 +2483,7 @@ class flow_seafloor_disp(flow_rock, mixIn_multi_data):
 
 
         tmp = self._get_pem_input('RPORV', time_input)
+        tmp, cutoff = self.filter_rporv(tmp, cutoff=cutoff_base, method='percentile', percentile=90)
         disp_input['RPORV'] = np.array(tmp[~tmp.mask], dtype=float)
 
         tmp = self._get_pem_input('PRESSURE', time_input)
@@ -2190,23 +2493,89 @@ class flow_seafloor_disp(flow_rock, mixIn_multi_data):
         #    tmp = tmp + tmp_baseline
         disp_input['PRESSURE'] = np.array(tmp[~tmp.mask], dtype=float)
         # convert pressure from Bar to MPa
-        if 'press_conv' in self.pem_input and time_input == time:
-            disp_input['PRESSURE'] = disp_input['PRESSURE'] * self.pem_input['press_conv']
+        if 'press_conv' in self.pem.input and time_input == time:
+            disp_input['PRESSURE'] = disp_input['PRESSURE'] * self.pem.input['press_conv']
         #else:
-        #    print('Keyword RPORV missing from simulation output, need pdated porevolumes at each assimilation step')
+        #    print('Keyword RPORV missing from simulation output, need pdated pore volumes at each assimilation step')
 
 
         tmp_dyn_var['PRESSURE'] = disp_input['PRESSURE']
         tmp_dyn_var['RPORV'] = disp_input['RPORV']
         self.dyn_var.extend([tmp_dyn_var])
 
-        return disp_input
+        return disp_input, cutoff
 
     def compute_horizontal_distance(self, pos, x, y):
         dx = pos['x'][:, np.newaxis] - x
         dy = pos['y'][:, np.newaxis] - y
         rho = np.sqrt(dx ** 2 + dy ** 2).flatten()
         return rho
+
+    def _build_disp_kernel(self, grid, pos, poisson, compressibility, z_base, model):
+        """Precompute displacement Green's-function matrix for one grid/receiver geometry."""
+        # coordinates of active cell centres
+        cell_centre = self.find_cell_centre(grid)
+        x = np.asarray(cell_centre[0], dtype=float)
+        y = np.asarray(cell_centre[1], dtype=float)
+        z = np.asarray(cell_centre[2], dtype=float)
+
+        # receiver coordinates
+        rx = np.asarray(pos['x'], dtype=float)
+        ry = np.asarray(pos['y'], dtype=float)
+        rz = np.asarray(pos['z'], dtype=float)
+
+        # elastic modulus in the same units as used in the original formulation
+        E = ((1 + poisson) * (1 - 2 * poisson)) / ((1 - poisson) * compressibility)
+
+        if model == 'van_Opstal':
+            component = ["Geertsma_vertical", "System_3_vertical"]
+        else:
+            component = ["Geertsma_vertical"]
+
+        geertsma_mode = str(self.disp_config.get('geertsma_mode', 'integral')).lower()
+
+        # Early receiver-distance truncation (same criterion as in compute_deformation_transfer).
+        trunc_factor = float(self.disp_config.get('receiver_trunc_factor', 3.0))
+        if trunc_factor <= 0:
+            raise ValueError(
+                f"Invalid SEA_DISP config: receiver_trunc_factor={trunc_factor}. Must be > 0."
+            )
+
+        # Precompute horizontal distances from all receivers to all active cells.
+        dx = rx[:, np.newaxis] - x[np.newaxis, :]
+        dy = ry[:, np.newaxis] - y[np.newaxis, :]
+        rho_mat = np.sqrt(dx * dx + dy * dy)
+
+        n_rec = rx.size
+        n_cells = x.size
+        kernel = np.zeros((n_rec, n_cells), dtype=float)
+
+        for j in range(n_cells):
+            # Skip receivers that are guaranteed to be zero according to the far-field cutoff.
+            max_rho = np.abs(z[j] - rz) * trunc_factor
+            active = rho_mat[:, j] <= max_rho
+            if not np.any(active):
+                continue
+
+            # Optional fast Geertsma mode: closed-form kernel approximation (much faster).
+            if model != 'van_Opstal' and geertsma_mode == 'fast':
+                rho_km = rho_mat[active, j] / 1e3
+                dz_km = np.abs(z[j] - rz[active]) / 1e3
+                denom = np.power(rho_km * rho_km + dz_km * dz_km, 1.5)
+                col = np.zeros_like(rho_km, dtype=float)
+                nz = denom > 0
+                # Same closed-form Geertsma transfer used elsewhere in this file.
+                col[nz] = (2.0 * dz_km[nz] / denom[nz]) * 1e-6
+                kernel[active, j] = col
+                continue
+
+            # dV=1 gives a linear kernel column; runtime response is kernel @ dV.
+            thh, trb = self.compute_deformation_transfer(
+                rz[active], z[j], z_base, rho_mat[active, j], poisson, E, 1.0, component
+            )
+            kernel[active, j] = (thh + trb) if model == 'van_Opstal' else thh
+
+        return kernel
 
     def map_z_response(self, base, repeat, grid, pos):
         """
@@ -2241,11 +2610,6 @@ class flow_seafloor_disp(flow_rock, mixIn_multi_data):
 
         compressibility = self.disp_config['compressibility'] # 1/MPa
 
-        E = ((1 + poisson) * (1 - 2 * poisson)) / ((1 - poisson) * compressibility)
-
-        # coordinates of cell centres
-        cell_centre = self.find_cell_centre(grid)
-
         # compute pore volume change between baseline and repeat survey
         # based on the reservoir pore volumes in the individual vintages
         if method == 'pressure':
@@ -2253,50 +2617,25 @@ class flow_seafloor_disp(flow_rock, mixIn_multi_data):
         else:
             dV = base['RPORV'] - repeat['RPORV']
 
-        # coordinates of active cell centres
-        x = cell_centre[0]
-        y = cell_centre[1]
-        z = cell_centre[2]
+        # Build (or reuse) linear response kernel for this geometry/configuration.
+        cache_key = (
+            model,
+            str(self.disp_config.get('geertsma_mode', 'integral')).lower(),
+            float(poisson),
+            float(compressibility),
+            float(z_base),
+            float(self.disp_config.get('receiver_trunc_factor', 3.0)),
+            int(np.asarray(grid['ACTNUM']).sum()),
+            int(np.asarray(pos['x']).size),
+        )
+        cached = getattr(self, '_disp_kernel_cache', None)
+        if cached is None or cached.get('key') != cache_key:
+            kernel = self._build_disp_kernel(grid, pos, poisson, compressibility, z_base, model)
+            self._disp_kernel_cache = {'key': cache_key, 'kernel': kernel}
+        else:
+            kernel = cached['kernel']
 
-
-        if model == 'van_Opstal':
-            # Represents a signal change for subsidence/uplift.
-            #trans_func = t_van_opstal
-            component = ["Geertsma_vertical", "System_3_vertical"]
-        else:  # Use Geertsma
-            #trans_func = t_geertsma
-            component = ["Geertsma_vertical"]
-        # Initialization
-        dz_1_2 = 0
-        dz_3 = 0
-
-        # indices of active cells:
-        true_indices = np.where(grid['ACTNUM'])
-        # number of active gridcells
-        n_nucleous = len(true_indices[0])
-        assert n_nucleous == len(x)
-        #pr = cProfile.Profile()
-        #pr.enable()
-
-        for j in range(n_nucleous):
-            rho = self.compute_horizontal_distance(pos, x[j], y[j])
-            THH, TRB = self.compute_deformation_transfer(pos['z'], z[j], z_base, rho, poisson, E, dV[j], component)
-            dz_1_2 = dz_1_2 + THH
-            dz_3 = dz_3 + TRB
-
-        #pr.disable()
-
-        # Print profiling results
-        #stats = pstats.Stats(pr)
-        #stats.strip_dirs()
-        #stats.sort_stats('cumulative')
-        #stats.print_stats()
-
-        if model == 'van_Opstal':
-            # Represents a signal change for subsidence/uplift.
-            dz = dz_1_2 + dz_3
-        else:  # Use Geertsma
-            dz = dz_1_2
+        dz = np.asarray(kernel @ np.asarray(dV, dtype=float), dtype=float)
 
         # Convert from meters to centimeters
         dz *= 100
@@ -2586,7 +2925,8 @@ class flow_seafloor_disp(flow_rock, mixIn_multi_data):
         """
         # list of configuration parameters in the "Grav" section of teh pipt file
         config_para_list = ['baseline', 'vintage', 'method', 'model', 'poisson', 'compressibility',
-                            'z_base', 'meas_spacing', 'padding', 'seabed', 'water_depth']
+                            'z_base', 'meas_spacing', 'padding', 'seabed', 'water_depth', 'baseline_mode',
+                            'receiver_trunc_factor', 'geertsma_mode']
 
         if 'sea_disp' in self.input_dict:
             self.disp_config = {}
@@ -2595,12 +2935,36 @@ class flow_seafloor_disp(flow_rock, mixIn_multi_data):
                 if elem[0] == 'vintage' and not isinstance(elem[1], list):
                     elem[1] = [elem[1]]
                 self.disp_config[elem[0]] = elem[1]
+            self.disp_config['baseline_mode'] = str(self.disp_config.get('baseline_mode', 'fixed')).lower()
+            if self.disp_config['baseline_mode'] not in ('fixed', 'rolling'):
+                raise ValueError(
+                    f"Invalid SEA_DISP config: baseline_mode={self.disp_config['baseline_mode']}. "
+                    "Expected 'fixed' or 'rolling'."
+                )
+            self.disp_config['receiver_trunc_factor'] = float(
+                self.disp_config.get('receiver_trunc_factor', 3.0)
+            )
+            if self.disp_config['receiver_trunc_factor'] <= 0:
+                raise ValueError(
+                    f"Invalid SEA_DISP config: receiver_trunc_factor={self.disp_config['receiver_trunc_factor']}. "
+                    "Must be > 0."
+                )
+
+            self.disp_config['geertsma_mode'] = str(
+                self.disp_config.get('geertsma_mode', 'integral')
+            ).lower()
+            if self.disp_config['geertsma_mode'] not in ('integral', 'fast'):
+                raise ValueError(
+                    f"Invalid SEA_DISP config: geertsma_mode={self.disp_config['geertsma_mode']}. "
+                    "Expected 'integral' or 'fast'."
+                )
         else:
             self.disp_config = None
 
     def extract_data(self, member):
         # start by getting the data from the flow simulator i.e. prod. and inj. data
         super(flow_rock, self).extract_data(member)
+        self._recover_missing_well_summary_data(member)
 
         # get the gravity data from results
         for prim_ind in self.l_prim:
@@ -2668,6 +3032,7 @@ class flow_multi_data(flow_avo, flow_grav, flow_seafloor_disp):
     def extract_data(self, member):
         # start by getting the data from the flow simulator i.e. prod. and inj. data
         super(flow_rock, self).extract_data(member)
+        self._recover_missing_well_summary_data(member)
 
         # get the gravity data from results
         for prim_ind in self.l_prim:
@@ -2679,14 +3044,12 @@ class flow_multi_data(flow_avo, flow_grav, flow_seafloor_disp):
                         self.pred_data[prim_ind][key] = self.grav_result[v].flatten()
 
                 if 'avo' in key:
-                    if self.true_prim[1][prim_ind] in self.pem_input['vintage']:
-                        idx = self.pem_input['vintage'].index(self.true_prim[1][prim_ind])
-                        filename = self.folder + os.sep + key + '_vint' + str(idx) + '.npz' if self.folder[-1] != os.sep \
-                            else self.folder + key + '_vint' + str(idx) + '.npz'
-                        with np.load(filename) as f:
-                            self.pred_data[prim_ind][key] = f[key]
+                    if self.true_prim[1][prim_ind] in self.pem.input['vintage']:
+                        idx = self.pem.input['vintage'].index(self.true_prim[1][prim_ind])
+                        self.pred_data[prim_ind][key] = self.avo_result[idx].flatten()
 
                 if 'sea_disp' in key:
                     if self.true_prim[1][prim_ind] in self.disp_config['vintage']:
                         v = self.disp_config['vintage'].index(self.true_prim[1][prim_ind])
                         self.pred_data[prim_ind][key] = self.disp_result[v].flatten()
+
