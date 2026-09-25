@@ -12,13 +12,17 @@ It supports:
   ``list`` / ``dict`` / ``DataFrame`` output formats.
 * Adjoint sensitivity computation for well-based objectives with respect to
   reservoir parameters (porosity, permeability, optionally log-scaled or
-  copied across PERMX/Y/Z).
+  copied across PERMX/Y/Z). Permeability gradients account for the two ways a
+  deck makes other quantities depend on the permeability field: a COMPDAT
+  connection factor left defaulted (well-index chain rule) and PERMY/PERMZ
+  produced by ``COPY`` from PERMX. Both are detected from the deck by default.
 
 The wrapper communicates with Julia via :mod:`juliacall`. Heavy Julia state
 is created lazily inside worker processes so the class can be pickled for
 multiprocessing.
 """
 
+import hashlib
 import os
 import shutil
 import warnings
@@ -116,10 +120,201 @@ PERM_KEYS: tuple[str, ...] = ("PERMX", "PERMY", "PERMZ")
 #: Map lower-case permeability parameter substring -> axis index in PERM_KEYS.
 PERM_INDEX: dict[str, int] = {"permx": 0, "permy": 1, "permz": 2}
 
+#: Accepted values for the ``well_index_from_perm`` option.
+VALID_WI_MODES: frozenset[Any] = frozenset({"auto", True, False})
+
+#: Accepted values for the ``perm_copied`` option.
+VALID_PERM_COPY_MODES: frozenset[Any] = frozenset({"auto", True, False})
+
+#: Relative tolerance for deciding that PERMY/PERMZ is a constant multiple of
+#: PERMX. A deck ``COPY`` is applied verbatim, so a plain copy matches exactly;
+#: the tolerance only absorbs the rounding of a following ``MULTIPLY``.
+PERM_COPY_RTOL: float = 1e-10
+
+#: Relative tolerance used to recognise a well index that JutulDarcy itself
+#: computed from the permeability field. A defaulted COMPDAT connection factor
+#: is bit-for-bit what :func:`compute_peaceman_index` returns, so anything that
+#: survives this comparison came from the Peaceman formula rather than the deck.
+WI_PEACEMAN_RTOL: float = 1e-10
+
+#: Julia helpers that JutulDarcy does not expose itself. Defined once per Julia
+#: session by :func:`_ensure_julia_helpers`.
+#:
+#: ``subsurface_sensitivities_with_wells``
+#:     ``JutulDarcy.reservoir_sensitivities`` narrows the adjoint result to the
+#:     ``:Reservoir`` submodel and throws the rest away, which loses
+#:     ``dJ/dWellIndices``. This repeats its post-processing but also returns the
+#:     untouched per-model sensitivities, so one adjoint solve serves both.
+#:
+#: ``subsurface_wi_perm_jacobian``
+#:     Differentiates JutulDarcy's own Peaceman routine, so ``dWI/dK`` follows
+#:     whatever formula (and defaults handling) the installed version uses.
+#:
+#: ``subsurface_adjoint_packed`` / ``subsurface_adjoint_storage``
+#:     The per-member work that `solve_adjoint_sensitivities` repeats for every
+#:     objective: expanding the result to ministeps, and allocating the two
+#:     adjoint simulators. Hoisting them out is worth ~20% of a sweep.
+#:
+#: ``subsurface_packed_step_times``
+#:     Substep times as the adjoint solver itself sees them, used to decide how
+#:     far back a given objective actually has to sweep.
+#:
+#: ``subsurface_sensitivities_reuse``
+#:     One adjoint sweep against pre-built storage, stopping at `n_steps`. An
+#:     objective that only fires at report step k has zero adjoint contribution
+#:     from every later step, so sweeping them is wasted work.
+_JULIA_HELPERS: str = """
+function subsurface_sensitivities_with_wells(case, result, obj)
+    sens = Jutul.solve_adjoint_sensitivities(case, result, obj)
+    rmodel = JutulDarcy.reservoir_model(case.model)
+    rsens = haskey(sens, :Reservoir) ? sens[:Reservoir] : sens
+    grad = Jutul.data_domain_to_parameters_gradient(rmodel, rsens)
+    for (k, pdef) in pairs(Jutul.get_parameters(rmodel))
+        grad[k, Jutul.associated_entity(pdef)] = rsens[k]
+    end
+    return (reservoir = grad, models = sens)
+end
+
+function subsurface_wi_perm_jacobian(case, rtol)
+    out = Dict{Symbol, Any}()
+    model = case.model
+    rdomain = JutulDarcy.reservoir_domain(model)
+    ncells = Jutul.number_of_cells(rdomain)
+    model isa Jutul.MultiModel || return (ncells = ncells, wells = out)
+    gdim = Jutul.dim(Jutul.physical_representation(rdomain))
+    p = JutulDarcy.Perforations()
+    for (name, m) in pairs(model.models)
+        JutulDarcy.model_or_domain_is_well(m) || continue
+        dd = m.data_domain
+        WI    = dd[:well_index, p]
+        dims  = dd[:cell_dims, p]
+        perm  = dd[:permeability, p]
+        ntg   = dd[:net_to_gross, p]
+        dir   = dd[:perforation_direction, p]
+        skin  = dd[:skin, p]
+        Kh    = dd[:Kh, p]
+        rad   = dd[:perforation_radius, p]
+        drain = dd[:drainage_radius, p]
+        cells = Jutul.physical_representation(m.domain).perforations.reservoir
+        n = length(WI)
+        nrow = perm isa AbstractVector ? 1 : size(perm, 1)
+        J = zeros(nrow, n)
+        from_perm = falses(n)
+        for i in 1:n
+            K = Float64.(perm isa AbstractVector ? [perm[i]] : collect(perm[:, i]))
+            peaceman = kk -> JutulDarcy.compute_peaceman_index(
+                dims[i], Jutul.expand_perm(kk, gdim), rad[i], dir[i];
+                skin = skin[i],
+                Kh = Kh[i],
+                net_to_gross = ntg[i],
+                drainage_radius = drain[i],
+                check = false
+            )
+            from_perm[i] = isapprox(WI[i], peaceman(K), rtol = rtol)
+            J[:, i] = JutulDarcy.ForwardDiff.gradient(peaceman, K)
+        end
+        out[name] = (
+            cells = collect(cells),
+            dWI_dK = J,
+            from_perm = collect(from_perm)
+        )
+    end
+    return (ncells = ncells, wells = out)
+end
+
+function subsurface_adjoint_packed(case, result)
+    simresult = hasproperty(result, :result) ? result.result : result
+    states, dt, step_ix = Jutul.expand_to_ministeps(simresult)
+    forces = case.forces
+    if forces isa Vector
+        forces = forces[step_ix]
+    end
+    return (states = states, dt = dt, forces = forces)
+end
+
+function subsurface_adjoint_storage(case)
+    return Jutul.setup_adjoint_storage(case.model;
+        state0 = case.state0,
+        parameters = case.parameters
+    )
+end
+
+function subsurface_packed_step_times(packed)
+    ps = Jutul.AdjointPackedResult(packed.states, packed.dt, packed.forces)
+    return [ps[i].step_info[:time] for i in 1:length(ps)]
+end
+
+function subsurface_sensitivities_reuse(case, storage, packed, obj, n_steps)
+    # Objective sparsity is cached on the storage after the first solve, so it
+    # has to be dropped between objectives -- they touch different wells.
+    osp = storage.objective_sparsity
+    if !isnothing(osp)
+        osp[:forward] = nothing
+        osp[:parameter] = nothing
+    end
+
+    # `setup_adjoint_storage` builds the linear solver as a per-call default, so
+    # the original code gave every objective a fresh GenericKrylov -- fresh
+    # preconditioner and fresh scaling state. Reusing one across objectives
+    # changes the iterates and moves the gradients around inside the solver
+    # tolerance, so rebuild it here. It is cheap next to the two simulators the
+    # storage holds, which is what we are actually hoisting.
+    storage.forward_config[:linear_solver] =
+        Jutul.select_linear_solver(case.model, mode = :adjoint, rtol = 1e-6)
+
+    @. storage.dx = 0
+    @. storage.rhs = 0
+    @. storage.lagrange = 0
+    @. storage.lagrange_buffer = 0
+
+    n = min(n_steps, length(packed.states))
+    forces = packed.forces isa Vector ? packed.forces[1:n] : packed.forces
+    pmodel = storage.parameter.model
+    dG = zeros(Jutul.number_of_degrees_of_freedom(pmodel))
+    Jutul.solve_adjoint_sensitivities!(
+        dG, storage,
+        packed.states[1:n], case.state0, packed.dt[1:n], obj;
+        forces = forces
+    )
+
+    sens = Jutul.store_sensitivities(pmodel, dG, storage.parameter_map)
+    rmodel = JutulDarcy.reservoir_model(case.model)
+    rsens = haskey(sens, :Reservoir) ? sens[:Reservoir] : sens
+    grad = Jutul.data_domain_to_parameters_gradient(rmodel, rsens)
+    for (k, pdef) in pairs(Jutul.get_parameters(rmodel))
+        grad[k, Jutul.associated_entity(pdef)] = rsens[k]
+    end
+    return (reservoir = grad, models = sens)
+end
+"""
+
 
 # ============================================================================ #
 # Configuration dataclasses
 # ============================================================================ #
+@dataclass
+class PermCopySpec:
+    """
+    Which permeability directions are slaved to PERMX, and by what factor.
+
+    A deck that writes only PERMX and then ``COPY``s it into PERMY/PERMZ has a
+    single permeability degree of freedom, so the derivative w.r.t. that
+    control is the sum over all three directions rather than the PERMX partial
+    alone. ``ratio`` carries the constant factor of any ``MULTIPLY`` applied
+    after the copy (1.0 for a plain copy).
+
+    Attributes
+    ----------
+    include : np.ndarray
+        Boolean mask over permeability directions; ``include[0]`` (PERMX, the
+        master) is always True.
+    ratio : np.ndarray
+        ``PERM<axis> / PERMX`` for included directions, 0.0 otherwise.
+    """
+    include: np.ndarray
+    ratio: np.ndarray
+
+
 @dataclass
 class AdjointObjective:
     """
@@ -406,8 +601,246 @@ def _extract_key_value(root_object, keys, julia):
     return None
 
 
+def _detect_copied_perm_axes(case, actnum: np.ndarray, perm_copied: Any,
+                             julia) -> PermCopySpec | None:
+    """
+    Work out which permeability directions move with PERMX.
+
+    ``COPY``/``MULTIPLY`` are applied while the deck is parsed and leave no
+    record behind, so the copy is recovered numerically: a direction counts as
+    slaved when its array is a constant multiple of PERMX over every active
+    cell.
+
+    Parameters
+    ----------
+    case : Any
+        Julia case object.
+    actnum : np.ndarray
+        Flat ACTNUM vector (1/0).
+    perm_copied : {"auto", True, False}
+        ``"auto"`` detects; ``True`` forces all three directions in at ratio
+        1.0 (the historical behaviour); ``False`` disables summation.
+    julia : juliacall.Main
+        Julia main module.
+
+    Returns
+    -------
+    PermCopySpec or None
+        ``None`` when the gradient should stay a per-direction partial.
+
+    Warns
+    -----
+    UserWarning
+        If PERMX is uniform, in which case the test cannot discriminate.
+
+    Notes
+    -----
+    Directions are judged one at a time, so copying PERMX into PERMY while
+    specifying PERMZ independently is handled correctly.
+
+    A copy applied to only part of the grid (a ``BOX``) is deliberately *not*
+    detected: the ratio is then non-constant, and a spatially varying ratio
+    cannot be told apart from two independently specified fields.
+    """
+    if perm_copied is False:
+        return None
+    n = len(PERM_KEYS)
+    if perm_copied is True:
+        return PermCopySpec(np.ones(n, dtype=bool), np.ones(n, dtype=np.float64))
+
+    include = np.zeros(n, dtype=bool)
+    ratio = np.zeros(n, dtype=np.float64)
+    include[0], ratio[0] = True, 1.0
+
+    grid = case.input_data["GRID"]
+    active = actnum == 1
+
+    def _column(key: str) -> np.ndarray | None:
+        if not julia.haskey(grid, key):
+            return None
+        return np.asarray(grid[key], dtype=np.float64).flatten(order="F")[active]
+
+    master = _column(PERM_KEYS[0])
+    if master is None or not np.any(master):
+        # Nothing to compare against, so no direction can be shown to be a copy.
+        return None
+
+    # Proportionality carries no information about a uniform PERMX: every
+    # constant field is a multiple of it, so a genuinely independent PERMZ
+    # would be indistinguishable from a copy. Stay with the partial derivative
+    # and let the user settle it.
+    if np.ptp(master) <= PERM_COPY_RTOL * abs(float(np.mean(master))):
+        warnings.warn(
+            "PERMX is uniform, so a COPY into PERMY/PERMZ cannot be told apart "
+            "from independently specified fields. Falling back to per-direction "
+            "partial derivatives; set 'perm_copied' to True or False to choose "
+            "explicitly.",
+            UserWarning,
+            stacklevel=2,
+        )
+        return None
+
+    denom = float(master @ master)
+    for axis in range(1, n):
+        other = _column(PERM_KEYS[axis])
+        if other is None:
+            continue
+        # Least-squares ratio, then verified pointwise so that a merely
+        # correlated field is not mistaken for a copy.
+        r = float(master @ other) / denom
+        if r != 0.0 and np.allclose(other, r * master, rtol=PERM_COPY_RTOL, atol=0.0):
+            include[axis], ratio[axis] = True, r
+
+    if not include[1:].any():
+        # No direction is slaved to PERMX: the three fields are independent, so
+        # each parameter must keep its own partial derivative. Returning a spec
+        # would collapse them onto the master and silently give dJ/dPERMX for
+        # permy and permz too.
+        return None
+    return PermCopySpec(include, ratio)
+
+
+def _ensure_julia_helpers(julia) -> None:
+    """
+    Define :data:`_JULIA_HELPERS` in the Julia session if not already present.
+
+    Julia state persists for the lifetime of a worker process, so this is a
+    no-op on every call after the first.
+
+    The marker is derived from the helper source, so a session that already
+    holds an older definition redefines rather than silently keeping it.
+
+    Parameters
+    ----------
+    julia : juliacall.Main
+        Julia main module.
+    """
+    digest = hashlib.md5(_JULIA_HELPERS.encode()).hexdigest()[:12]
+    marker = f"subsurface_helpers_{digest}"
+    if julia.seval(f"@isdefined({marker})"):
+        return
+    julia.seval(_JULIA_HELPERS)
+    julia.seval(f"{marker} = true")
+
+
+def _well_index_perm_jacobian(case, julia,
+                              well_index_from_perm: Any = "auto"
+                              ) -> tuple[dict[str, dict], int]:
+    """
+    Differentiate every perforation's well index w.r.t. cell permeability.
+
+    A ``.DATA`` deck that leaves the COMPDAT connection-transmissibility factor
+    defaulted makes the well index a *function* of the permeability field via
+    the Peaceman formula. JutulDarcy evaluates that function once during case
+    setup and then treats ``WellIndices`` as an independent parameter, so its
+    permeability gradient is a partial derivative that misses
+    ``(dJ/dWI)·(dWI/dK)``. This returns the ``dWI/dK`` half of that term.
+
+    Parameters
+    ----------
+    case : Any
+        Julia case object.
+    julia : juliacall.Main
+        Julia main module.
+    well_index_from_perm : {"auto", True, False}, optional
+        Which perforations to treat as permeability-derived. ``"auto"``
+        (default) keeps the ones whose stored well index matches a fresh
+        Peaceman evaluation, i.e. exactly the defaulted COMPDAT entries.
+        ``True`` forces every perforation, ``False`` selects none.
+
+    Returns
+    -------
+    dict[str, dict]
+        ``{well_name: {"cells": 1-based reservoir cell index per kept
+        perforation, "keep": boolean mask over all of the well's perforations,
+        "dWI_dK": (n_axis, n_kept) array}}``. Wells with no kept perforation
+        are omitted.
+    int
+        Number of cells in the reservoir domain, i.e. the column count of the
+        reservoir permeability gradient. Zero when no jacobian was built.
+    """
+    if well_index_from_perm is False:
+        return {}, 0
+
+    _ensure_julia_helpers(julia)
+    jac = julia.subsurface_wi_perm_jacobian(case, WI_PEACEMAN_RTOL)
+    ncells = int(jac.ncells)
+    wells = jac.wells
+    out: dict[str, dict] = {}
+    for name in julia.keys(wells):
+        entry = wells[name]
+        keep = (
+            np.ones(len(entry.cells), dtype=bool)
+            if well_index_from_perm is True
+            else np.asarray(entry.from_perm, dtype=bool)
+        )
+        if not keep.any():
+            continue
+        out[str(name)] = {
+            "cells": np.asarray(entry.cells, dtype=np.int64)[keep],
+            "keep": keep,
+            "dWI_dK": np.asarray(entry.dWI_dK, dtype=np.float64)[:, keep],
+        }
+    return out, ncells
+
+
+def _well_index_chain_term(wi_jacobian: dict[str, dict], wi_gradients,
+                           ncells: int, julia) -> np.ndarray:
+    """
+    Assemble ``sum_perf (dJ/dWI)·(dWI/dK)`` on the active-cell permeability grid.
+
+    Parameters
+    ----------
+    wi_jacobian : dict[str, dict]
+        Output of :func:`_well_index_perm_jacobian`; must be non-empty.
+    wi_gradients : Any
+        Julia mapping from well name to that well's parameter sensitivities;
+        each entry is expected to hold a ``WellIndices`` vector.
+    ncells : int
+        Number of cells in the reservoir domain.
+    julia : juliacall.Main
+        Julia main module.
+
+    Returns
+    -------
+    np.ndarray
+        ``(n_axis, ncells)`` array, zero everywhere except at perforated cells.
+        ``n_axis`` follows the permeability layout of the reservoir domain.
+
+    Raises
+    ------
+    ValueError
+        If a well's ``WellIndices`` sensitivity cannot be located.
+    """
+    n_axis = next(iter(wi_jacobian.values()))["dWI_dK"].shape[0]
+    term = np.zeros((n_axis, ncells), dtype=np.float64)
+    for well, entry in wi_jacobian.items():
+        well_sens = _get_mapping_value(wi_gradients, well, julia)
+        wi_grad = (
+            None if well_sens is None
+            else _get_mapping_value(well_sens, "WellIndices", julia)
+        )
+        if wi_grad is None:
+            raise ValueError(
+                f"Could not find the WellIndices sensitivity for well '{well}'; "
+                "the well-index chain rule cannot be applied. Set "
+                "'well_index_from_perm': False to fall back to the partial "
+                "derivative."
+            )
+        # `wi_grad` covers every perforation of the well, so drop the ones
+        # whose well index was fixed in the deck before contracting.
+        dJ_dWI = np.asarray(wi_grad, dtype=np.float64)[entry["keep"]]
+
+        # `cells` is 1-based (Julia) and may repeat when one cell holds several
+        # perforations, so accumulate rather than assign.
+        np.add.at(term, (slice(None), entry["cells"] - 1),
+                  entry["dWI_dK"] * dJ_dWI)
+    return term
+
+
 def _extract_adjoint(jlgrad, jlcase, parameter: str, actnum: np.ndarray,
-                     perm_copied: bool, julia) -> np.ndarray:
+                     perm_copy: PermCopySpec | None, julia,
+                     wi_chain_term: np.ndarray | None = None) -> np.ndarray:
     """
     Extract and post-process an adjoint gradient for a single parameter.
 
@@ -427,11 +860,19 @@ def _extract_adjoint(jlgrad, jlcase, parameter: str, actnum: np.ndarray,
         enables log-scaling for permeability.
     actnum : np.ndarray
         Flat ACTNUM vector (1/0) for embedding into the full grid.
-    perm_copied : bool
-        If ``True``, treat PERMX as the master and sum contributions from all
-        three permeability directions into the returned gradient.
+    perm_copy : PermCopySpec or None
+        Which permeability directions are slaved to PERMX (see
+        :func:`_detect_copied_perm_axes`). When given, PERMX is the master and
+        the returned gradient sums the slaved directions into it. ``None``
+        returns the partial derivative for the direction named in
+        ``parameter``.
     julia : juliacall.Main
         Julia main module.
+    wi_chain_term : np.ndarray, optional
+        ``(n_axis, n_active)`` well-index chain-rule contribution from
+        :func:`_well_index_chain_term`, in the same SI units as the raw Julia
+        permeability gradient. Added before any scaling. Ignored for
+        non-permeability parameters.
 
     Returns
     -------
@@ -441,7 +882,8 @@ def _extract_adjoint(jlgrad, jlcase, parameter: str, actnum: np.ndarray,
     Raises
     ------
     ValueError
-        If the gradient could not be located or the parameter is unsupported.
+        If the gradient could not be located, the parameter is unsupported, or
+        ``wi_chain_term`` does not match the shape of the permeability gradient.
     """
     p = parameter.lower()
 
@@ -460,6 +902,19 @@ def _extract_adjoint(jlgrad, jlcase, parameter: str, actnum: np.ndarray,
             raise ValueError(f"Could not find permeability gradient for '{parameter}'")
 
         full = np.asarray(grad)              # shape: (3, n_active)
+
+        # JutulDarcy differentiates w.r.t. permeability with the well indices
+        # held fixed. Where those indices were derived from the permeability
+        # (defaulted COMPDAT connection factors) the total derivative needs the
+        # extra (dJ/dWI)·(dWI/dK) term folded in before scaling.
+        if wi_chain_term is not None:
+            if wi_chain_term.shape != full.shape:
+                raise ValueError(
+                    f"Well-index chain term has shape {wi_chain_term.shape}, "
+                    f"expected {full.shape} to match the permeability gradient"
+                )
+            full = full + wi_chain_term
+
         mdarcy = julia.seval("si_unit(:milli)*si_unit(:darcy)")  # mD → SI factor
 
         def _scale(adj: np.ndarray, axis: int) -> np.ndarray:
@@ -469,12 +924,21 @@ def _extract_adjoint(jlgrad, jlcase, parameter: str, actnum: np.ndarray,
                 return adj * perm.flatten(order="F")
             return adj * mdarcy
 
-        # Copied-permeability case: aggregate gradients from all 3 axes.
-        if perm_copied:
+        # Copied-permeability case: PERMX is the control, so aggregate every
+        # direction that moves with it.
+        #
+        # With PERM<i> = r_i * PERMX the total derivative is
+        #     dJ/dPERMX      = sum_i r_i * dJ/dPERM<i>
+        #     dJ/dlog(PERMX) = sum_i PERM<i> * dJ/dPERM<i>
+        # so the log branch of `_scale` already carries r_i through PERM<i>,
+        # while the unit-converted branch has to apply it explicitly.
+        if perm_copy is not None:
             out = np.zeros(actnum.shape, dtype=np.float64)
-            for i in range(3):
-                adj = _active_to_full_grid(full[i], actnum)
-                out += _scale(adj, i)
+            for i, (use, r) in enumerate(zip(perm_copy.include, perm_copy.ratio)):
+                if not use:
+                    continue
+                contribution = _scale(_active_to_full_grid(full[i], actnum), i)
+                out += contribution if log_scale else r * contribution
             return out
 
         # Otherwise pick the axis encoded in the parameter name.
@@ -585,28 +1049,58 @@ class JutulDarcy:
 
         - ``runfile`` : str
             Path to a ``.mako`` template or ``.DATA`` file.
+
         - ``reporttype`` : {"days", "dates"}
             How report points are interpreted. Default ``"days"``.
+
         - ``reportpoint`` : list
             Report points (numeric days or :class:`datetime.datetime`).
+
         - ``datatype`` : list[str]
             Summary keywords to extract. Default
             ``["FOPT", "FGPT", "FWPT", "FWIT"]``.
+
         - ``adjoints`` : dict
             Objective/parameter spec; enables adjoint computation.
+
         - ``output_format`` : {"list", "dict", "dataframe"}
             Output container type. Default ``"dataframe"``.
+
         - ``adjoint_pbar`` : bool
             Show a per-objective progress bar. Default ``False``.
+
         - ``parallel`` : int
             Number of worker processes. Default ``1``.
-        - ``perm_copied`` : bool
-            See :func:`_extract_adjoint`. Default ``False``.
+                    
+        - ``perm_copied`` : {"auto", True, False}
+            Whether PERMY/PERMZ are slaved to PERMX (deck ``COPY``), making
+            permeability gradients total derivatives w.r.t. PERMX rather than
+            per-direction partials. ``"auto"`` (default) detects it from the
+            deck; see :func:`_detect_copied_perm_axes`.
+
+        - ``well_index_from_perm`` : {"auto", True, False}
+            Whether permeability gradients include the well-index chain rule
+            for perforations whose COMPDAT connection factor is derived from
+            the permeability. See :func:`_well_index_perm_jacobian`. Default
+            ``"auto"``.
+
         - ``adjoint_mode`` : {"sensitivities", "optimization"}
             Selects the JutulDarcy gradient pathway. Default
             ``"sensitivities"``.
+
+        - ``adjoint_reuse_storage`` : bool
+            Build the adjoint storage once per member instead of once per
+            objective, and stop each objective's backward sweep at its own
+            evaluation point. Roughly 1.5x faster with many data points.
+            Gradients shift by ~1e-4 relative: Jutul's adjoint linear solver is
+            iterative and carries state on the storage, so a reused storage
+            converges to slightly different points inside the solver tolerance.
+            Set False for results bit-identical to the per-objective path.
+            Only applies to ``adjoint_mode="sensitivities"``. Default True.
+
         - ``optimization_targets`` : Any
             Reserved for future use.
+            
         - ``eval_adjoint_funcs`` : bool
             If True, store objective function values in ``self.adjoint_funcs``.
 
@@ -660,8 +1154,22 @@ class JutulDarcy:
             )
         self.adjoint_pbar = options.get("adjoint_pbar", False)
         self.parallel = int(options.get("parallel", 1))
-        self.perm_copied = options.get("perm_copied", False)
+        self.perm_copied = options.get("perm_copied", "auto")
+        if self.perm_copied not in VALID_PERM_COPY_MODES:
+            raise ValueError(
+                f"Invalid perm_copied '{self.perm_copied}'. "
+                f"Must be 'auto', True or False"
+            )
+        self.well_index_from_perm = options.get("well_index_from_perm", "auto")
+        if self.well_index_from_perm not in VALID_WI_MODES:
+            raise ValueError(
+                f"Invalid well_index_from_perm '{self.well_index_from_perm}'. "
+                f"Must be 'auto', True or False"
+            )
         self.adjoint_mode = options.get("adjoint_mode", "sensitivities")
+        self.adjoint_reuse_storage = bool(
+            options.get("adjoint_reuse_storage", True)
+        )
         if self.adjoint_mode not in VALID_ADJOINT_MODES:
             raise ValueError(
                 f"Invalid adjoint_mode '{self.adjoint_mode}'. "
@@ -758,6 +1266,8 @@ class JutulDarcy:
         # multiprocessing's fork/spawn semantics.
         from juliacall import Main as julia
         julia.seval("using JutulDarcy, Jutul")
+        if self.compute_adjoints:
+            _ensure_julia_helpers(julia)
 
         folder = Path(f"En_{idn}")
         folder.mkdir(exist_ok=False)
@@ -772,7 +1282,7 @@ class JutulDarcy:
                 julia.case = case  # expose to Julia-side eval'd expressions
 
                 units = self._detect_units(case, julia)
-                actnum_vec = self._extract_actnum(case)
+                actnum_vec = self._extract_actnum(case, julia)
 
                 # Forward solve. `output_substates=True` keeps intermediate
                 # states needed for adjoint reconstruction.
@@ -872,27 +1382,68 @@ class JutulDarcy:
         return julia.missing
 
     @staticmethod
-    def _extract_actnum(case) -> np.ndarray:
+    def _extract_actnum(case, julia=None) -> np.ndarray:
         """
-        Return the flat ACTNUM array (1/0), defaulting to all-active.
+        Return the flat (1/0) mask of cells the simulation actually carries.
+
+        This follows the *processed* mesh rather than the deck's ACTNUM. Mesh
+        processing (pinch-out collapse, geometry repair) can drop cells that
+        ACTNUM marks active -- the coarsened Drogon grid loses one at
+        (19, 6, 12) -- and gradients come back on the processed mesh. Masking
+        with the deck's ACTNUM then either raises ("Parameter length does not
+        match number of active cells") or, if the counts happened to agree,
+        silently shifts every gradient value past the dropped cell onto its
+        neighbour.
+
+        Falls back to the deck's ACTNUM when the mesh exposes no cell map,
+        and to all-active when the deck has no ACTNUM either.
 
         Parameters
         ----------
         case : Any
             Julia case object.
+        julia : juliacall.Main, optional
+            Julia main module. Without it the deck's ACTNUM is used, which is
+            only correct when mesh processing dropped nothing.
 
         Returns
         -------
         np.ndarray
-            Flat (Fortran-ordered) ACTNUM vector.
+            Flat (Fortran-ordered) 1/0 vector over the full Cartesian grid.
         """
         nx, ny, nz = case.input_data["GRID"]["cartDims"]
+        ncell = int(nx) * int(ny) * int(nz)
+
+        if julia is not None:
+            try:
+                julia.case = case
+                cell_map = np.asarray(julia.seval(
+                    "let m = Jutul.physical_representation("
+                    "JutulDarcy.reservoir_domain(case.model)); "
+                    "[Int(c) for c in m.cell_map] end"
+                ), dtype=np.int64) - 1
+            except Exception:
+                cell_map = None
+            if cell_map is not None and cell_map.size:
+                # `_active_to_full_grid` fills the mask in ascending index
+                # order, so a cell map that is not sorted would scramble the
+                # gradient. Say so rather than return wrong numbers.
+                if not np.all(np.diff(cell_map) > 0):
+                    raise ValueError(
+                        "Reservoir cell map is not strictly ascending; the "
+                        "active-cell mask cannot represent it. The gradient "
+                        "would be scattered onto the wrong cells."
+                    )
+                actnum = np.zeros(ncell, dtype=np.int64)
+                actnum[cell_map] = 1
+                return actnum
+
         try:
             actnum = np.array(case.input_data["GRID"]["ACTNUM"])
             return actnum.flatten(order="F")
         except (KeyError, AttributeError):
             # No ACTNUM keyword in the deck => every cell is active.
-            return np.ones(nx * ny * nz)
+            return np.ones(ncell)
 
     def _format_output(self, pyres: pd.DataFrame):
         """Convert the per-member DataFrame to the user-requested container."""
@@ -959,13 +1510,50 @@ class JutulDarcy:
         jl_units = julia.Symbol(units) if isinstance(units, str) else units
         smry = julia.JutulDarcy.summary_result(jlcase, jlres, jl_units)
 
-        # JutulDarcy reports time in integer seconds; match against our
-        # requested report points by intersecting the two integer arrays.
-        sim_seconds = np.array(list(smry["TIME"].seconds), dtype=np.int64)
+        # JutulDarcy builds its time vector as a floating-point cumulative sum
+        # over adaptive ministeps (`output_substates=True` keeps every one of
+        # them), so a report boundary can land a fraction of a second below the
+        # whole second we asked for. Round to the nearest second -- truncating
+        # would turn e.g. 10367999.9999 into day 119, silently dropping the
+        # day-120 report point.
+        sim_seconds = np.rint(
+            np.array(list(smry["TIME"].seconds), dtype=np.float64)
+        ).astype(np.int64)
         self.start_date = jlcase.input_data["RUNSPEC"]["START"]
         self.report_seconds = self._compute_report_seconds()
 
-        idx = np.flatnonzero(np.isin(sim_seconds, self.report_seconds))
+        # Look each requested report point up explicitly rather than
+        # intersecting: this keeps the rows in the order given by
+        # `self.index[1]` and yields exactly one row per report point.
+        step_lookup = {t: i for i, t in enumerate(sim_seconds.tolist())}
+        missing = [t for t in self.report_seconds.tolist() if t not in step_lookup]
+        if missing:
+            last_sim = int(sim_seconds[-1])
+            last_req = int(self.report_seconds[-1])
+            if last_sim < last_req:
+                cause = (
+                    f"The run stopped at day {last_sim / SECONDS_PER_DAY:g} "
+                    f"of {last_req // SECONDS_PER_DAY}, so it aborted early. "
+                    f"Jutul returns partial results silently unless "
+                    f"`error_on_incomplete` is set."
+                )
+            else:
+                cause = (
+                    f"The run did reach the final report point (day "
+                    f"{last_req // SECONDS_PER_DAY}), so these times are not "
+                    f"report steps in the deck's SCHEDULE. Every requested "
+                    f"report point needs a matching DATES/TSTEP entry -- "
+                    f"the simulator only writes summary output at the report "
+                    f"steps the deck defines."
+                )
+            raise ValueError(
+                f"Simulation produced "
+                f"{len(self.report_seconds) - len(missing)} of "
+                f"{len(self.report_seconds)} requested report points. "
+                f"Missing at day(s) "
+                f"{[t // SECONDS_PER_DAY for t in missing]}. {cause}"
+            )
+        idx = np.array([step_lookup[t] for t in self.report_seconds.tolist()])
 
         res: dict[str, np.ndarray] = {}
         attrs: dict[str, str] = {}
@@ -1077,6 +1665,40 @@ class JutulDarcy:
             {col: [] for col in self.adjoint_info} if self.eval_adjoint_funcs else {}
         )
 
+        # dWI/dK depends only on the case, so it is built once and contracted
+        # with each objective's dJ/dWI below.
+        needs_perm = any(
+            "perm" in param.lower()
+            for obj in self.adjoint_info.values()
+            for param in obj.parameters
+        )
+        if needs_perm:
+            wi_jacobian, ncells = _well_index_perm_jacobian(
+                case, julia, self.well_index_from_perm
+            )
+            perm_copy = _detect_copied_perm_axes(
+                case, actnum_vec, self.perm_copied, julia
+            )
+        else:
+            wi_jacobian, ncells, perm_copy = {}, 0, None
+
+        # Build the adjoint storage and the ministep expansion once per member.
+        # `solve_adjoint_sensitivities` does both on every call, which is pure
+        # repetition when a member has many objectives. `step_times` then lets
+        # each objective stop its backward sweep at its own evaluation point.
+        step_times = None
+        if self.adjoint_mode == "sensitivities" and self.adjoint_reuse_storage:
+            julia.adj_packed = _suppress_julia(
+                julia, "subsurface_adjoint_packed(case, res)"
+            )
+            julia.adj_storage = _suppress_julia(
+                julia, "subsurface_adjoint_storage(case)"
+            )
+            step_times = np.asarray(
+                _suppress_julia(julia, "subsurface_packed_step_times(adj_packed)"),
+                dtype=float,
+            )
+
         pbar = self._make_adjoint_pbar(idn)
         sim_times = np.array(jlres.time) # Unit: seconds
         adjoint_index_final = None  # captured from the last objective
@@ -1101,7 +1723,24 @@ class JutulDarcy:
 
             for i, func in enumerate(funcs):
                 julia.func = func
-                grad = self._solve_adjoint(julia)
+
+                # The objective is zero after its own evaluation point, so the
+                # adjoint is zero there too: sweep no further back than that.
+                n_steps = None
+                if step_times is not None:
+                    n_steps = int(
+                        np.searchsorted(step_times, adj_seconds[i], side="right")
+                    ) or len(step_times)
+
+                grad, well_sens = self._solve_adjoint(julia, n_steps=n_steps)
+
+                # Well indices derived from the permeability field contribute
+                # (dJ/dWI)·(dWI/dK), which JutulDarcy's permeability gradient
+                # leaves out.
+                wi_chain_term = (
+                    _well_index_chain_term(wi_jacobian, well_sens, ncells, julia)
+                    if wi_jacobian else None
+                )
 
                 # Cross-check Julia's objective evaluation against the value
                 # we already obtained from the forward extraction.
@@ -1117,7 +1756,8 @@ class JutulDarcy:
                 for param in info.parameters:
                     grad_dict[(col, param)].append(
                         _extract_adjoint(grad, case, param, actnum_vec,
-                                         self.perm_copied, julia)
+                                         perm_copy, julia,
+                                         wi_chain_term=wi_chain_term)
                     )
 
         if self.adjoint_pbar:
@@ -1136,7 +1776,7 @@ class JutulDarcy:
 
         return adjoints
 
-    def _solve_adjoint(self, julia):
+    def _solve_adjoint(self, julia, n_steps: int | None = None):
         """
         Invoke the appropriate JutulDarcy adjoint solver for the current mode.
 
@@ -1145,22 +1785,43 @@ class JutulDarcy:
         julia : juliacall.Main
             Julia main module. The names ``case``, ``res``, ``grad_case`` and
             ``func`` are expected to be already bound in the Julia namespace.
+        n_steps : int, optional
+            Stop the backward sweep after this many substeps, reusing the
+            pre-built ``adj_storage`` / ``adj_packed`` bindings. When omitted,
+            each call builds its own storage and sweeps the whole horizon.
 
         Returns
         -------
-        Any
-            Raw Julia gradient object.
+        tuple
+            ``(gradient, well_sensitivities)``. The first element is the raw
+            Julia gradient object searched by :func:`_extract_adjoint`; the
+            second is a Julia mapping from well name to that well's parameter
+            sensitivities (used for the well-index chain rule), or ``None`` if
+            the mode does not expose them.
         """
         if self.adjoint_mode == "sensitivities":
-            return _suppress_julia(
-                julia,
-                "JutulDarcy.reservoir_sensitivities("
-                "case, res, func, include_parameters=true)"
-            )
-        return _suppress_julia(
+            # `reservoir_sensitivities` drops everything outside the reservoir
+            # submodel, so use our own wrapper that keeps the well
+            # sensitivities from the same adjoint solve.
+            if n_steps is None:
+                out = _suppress_julia(
+                    julia, "subsurface_sensitivities_with_wells(case, res, func)"
+                )
+            else:
+                out = _suppress_julia(
+                    julia,
+                    "subsurface_sensitivities_reuse("
+                    f"case, adj_storage, adj_packed, func, {n_steps})"
+                )
+            return out.reservoir, out.models
+
+        grad = _suppress_julia(
             julia,
             "JutulDarcy.parameters_gradient_reservoir(grad_case, func, deps=:case)"
         )
+        # The optimization dict mirrors `setup_reservoir_dict_optimization`, so
+        # the per-well entries already sit under a `:wells` key.
+        return grad, _extract_key_value(grad, "wells", julia)
 
     def _resolve_adjoint_steps(self, info: AdjointObjective):
         """
