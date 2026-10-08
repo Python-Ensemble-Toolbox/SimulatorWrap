@@ -122,8 +122,9 @@ class flow(eclipse):
         # Extract the filename from the kwargs
         filename_str = f'"{filename.upper()}"' if filename is not None else ""
     
-        # Ensure logs/ exists BEFORE writing script or running sbatch
-        # os.makedirs("logs", exist_ok=True)
+        # Start from an empty logs/ BEFORE writing script or running sbatch (avoids accumulating old logs)
+        shutil.rmtree("logs", ignore_errors=True)
+        os.makedirs("logs", exist_ok=True)
 
         # Extract mpi flag from kwargs
         mpi = kwargs.get("mpi", None)
@@ -160,9 +161,8 @@ class flow(eclipse):
 #SBATCH --ntasks={n_tasks}                                                                                          
 #SBATCH --cpus-per-task=2                                                                                 
 #SBATCH --export=ALL                                                                                      
-#SBATCH --output=/dev/null
-#SBATCH --error=/dev/null
-exec > /dev/null 2>&1
+#SBATCH --output=logs/job_%A_%a.out                                                                                                                                      
+#SBATCH --error=logs/job_%A_%a.err 
                                                                             
 # OPTIONAL: load modules here                                                                             
 {py_string}                                                              
@@ -294,7 +294,8 @@ python -m subsurface.multphaseflow.opm "$FOLDER" {filename} ""
             
     def are_jobs_done(self, job_id):
         """Check if all job array tasks are completed using sacct."""
-        check_cmd = ["sacct", "-j", f"{job_id}", "--format=JobID,State", "--noheader"]
+        # -X: only list the array tasks (allocations), not their job steps (.batch, .extern, ...)
+        check_cmd = ["sacct", "-X", "-j", f"{job_id}", "--format=JobID,State", "--noheader"]
 
         #        print(check_cmd)
 
@@ -306,22 +307,22 @@ python -m subsurface.multphaseflow.opm "$FOLDER" {filename} ""
 
         #        print(check_result.stdout)
 
-        return_states = []
+        failed_states = ["FAILED", "CANCELLED", "TIMEOUT", "OUT_OF_MEMORY", "NODE_FAIL"]
+        task_states = {}  # array task index -> success
 
         job_states = check_result.stdout.strip().split("\n")
         for job in job_states:
             parts = job.split()
             if len(parts) >= 2:
-                state = parts[1]
-                if state not in ["COMPLETED", "FAILED", "CANCELLED"]:
-                    return False  # A job is still running or pendin
-                else:
-                    if state == "FAILED" or state == "CANCELLED":
-                        return_states.append(False)
-                    else:
-                        return_states.append(True)
+                state = parts[1]  # e.g. "CANCELLED by 1234" -> "CANCELLED"
+                if state != "COMPLETED" and state not in failed_states:
+                    return False  # A job is still running or pending (incl. grouped lines like 123_[0-9])
+                # JobID is <job_id>_<task index>; map by index since sacct does not guarantee the order
+                match = re.fullmatch(rf"{job_id}_(\d+)", parts[0])
+                task_idx = int(match.group(1)) if match else 0
+                task_states[task_idx] = state not in failed_states
 
-        return return_states
+        return [task_states[idx] for idx in sorted(task_states)]
     
     def wait_for_jobs(self,job_id,wait_time=10):
         """Wait until all job array tasks are completed."""

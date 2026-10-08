@@ -87,13 +87,35 @@ def ecalc_npv_par(pred_data, **kwargs):
         indecies = [n for n in range(ne)]
 
         n_par = keys_opt.get('parallel', 50)
-        with Pool(n_par) as pool:
-            values = pool.map(_objective, indecies)
+
+        # Each worker starts its own NeqSim JVM (via eCalc). Cap the JVM heap, and recycle workers after a few
+        # tasks so the JVMs do not grow until the machine runs out of memory.
+        os.environ.setdefault('JAVA_TOOL_OPTIONS', keys_opt.get('ecalc_java_options', '-Xmx1g'))
+        max_tasks = keys_opt.get('ecalc_tasks_per_worker', 5)
+        with Pool(n_par, maxtasksperchild=max_tasks) as pool:
+            values = pool.map(_safe_objective, indecies)
+
+        # Retry failed members in fresh processes (a crashed JVM cannot be reused within the same worker)
+        failed = [n for n, v in zip(indecies, values) if v is None]
+        if failed:
+            with Pool(min(n_par, len(failed)), maxtasksperchild=1) as retry_pool:
+                for n, v in zip(failed, retry_pool.map(_safe_objective, failed)):
+                    values[n] = v
+            still_failed = [n for n in indecies if values[n] is None]
+            if still_failed:
+                raise RuntimeError(f'eCalc failed for members {still_failed} after retry')
 
         objective[l].extend(values)
         objective[l] = np.array(objective[l]) / const.get('obj_scaling', 1)
 
     return objective
+
+def _safe_objective(nc):
+    try:
+        return _objective(nc)
+    except Exception as e:
+        print(f'eCalc failed for member {nc}: {e!r}', flush=True)
+        return None
 
 def _objective(args):
     nc = args
@@ -133,33 +155,35 @@ def run_eCalc(n: int, ecalc_data: dict):
     from ecalc_cli.infrastructure.file_resource_service import FileResourceService
     from libecalc.presentation.yaml.file_configuration_service import FileConfigurationService
     
-    pd.DataFrame(ecalc_data).to_csv(f'ecalc_input_{n}.csv', index=False)
-    new_yaml = duplicate_yaml_file(sim_kwargs['ecalc_yamlfile'], n)
+    input_csv = f'ecalc_input_{n}.csv'
+    new_yaml = None
+    try:
+        pd.DataFrame(ecalc_data).to_csv(input_csv, index=False)
+        new_yaml = duplicate_yaml_file(sim_kwargs['ecalc_yamlfile'], n)
 
-    # Config
-    model_path = HERE/new_yaml
-    configuration_service = FileConfigurationService(configuration_path=model_path)
-    resource_service = FileResourceService(working_directory=model_path.parent)
-    yaml_model = YamlModel(configuration_service=configuration_service,
-                           resource_service=resource_service,
-                           output_frequency=Frequency.NONE)
+        # Config
+        model_path = HERE/new_yaml
+        configuration_service = FileConfigurationService(configuration_path=model_path)
+        resource_service = FileResourceService(working_directory=model_path.parent)
+        yaml_model = YamlModel(configuration_service=configuration_service,
+                               resource_service=resource_service,
+                               output_frequency=Frequency.NONE)
 
-    # Compute energy, emissions
-    model = EnergyCalculator(graph=yaml_model.get_graph())
-    consumer_results = model.evaluate_energy_usage(yaml_model.variables)
-    emission_results = model.evaluate_emissions(yaml_model.variables, consumer_results)
+        # Compute energy, emissions
+        model = EnergyCalculator(graph=yaml_model.get_graph())
+        consumer_results = model.evaluate_energy_usage(yaml_model.variables)
+        emission_results = model.evaluate_emissions(yaml_model.variables, consumer_results)
 
-    # Extract
-    energy = results_as_df(yaml_model, consumer_results, lambda r: r.component_result.energy_usage)
-    energy_total = energy.sum(1).rename("energy_total")
-    energy_total.to_csv(HERE / "energy.csv")
-    emissions = results_as_df(yaml_model, emission_results, lambda r: r['co2_fuel_gas'].rate)
-    emissions_total = emissions.sum(1).rename("emissions_total")
-    emissions_total.to_csv(HERE / "emissions.csv")
-    
-    # delete dummy files
-    os.remove(new_yaml)
-    os.remove(f'ecalc_input_{n}.csv')
+        # Extract
+        energy = results_as_df(yaml_model, consumer_results, lambda r: r.component_result.energy_usage)
+        energy_total = energy.sum(1).rename("energy_total")
+        emissions = results_as_df(yaml_model, emission_results, lambda r: r['co2_fuel_gas'].rate)
+        emissions_total = emissions.sum(1).rename("emissions_total")
+    finally:
+        # delete dummy files, also if eCalc failed
+        for f in (new_yaml, input_csv):
+            if f is not None and os.path.exists(f):
+                os.remove(f)
 
     return emissions_total, energy_total
 
@@ -186,12 +210,16 @@ def results_as_df(yaml_model, results, getter) -> pd.DataFrame:
 
 def duplicate_yaml_file(filename, member):
 
-    # Load the YAML file
-    try:
-        with open(filename, 'r') as yaml_file:
-            data = yaml.safe_load(yaml_file)
-    except:
-        time.sleep(2)
+    # Load the YAML file (retry a few times in case of transient file system errors)
+    for attempt in range(3):
+        try:
+            with open(filename, 'r') as yaml_file:
+                data = yaml.safe_load(yaml_file)
+            break
+        except OSError:
+            if attempt == 2:
+                raise
+            time.sleep(2)
 
     input_name = data['TIME_SERIES'][0]['FILE']
     data['TIME_SERIES'][0]['FILE'] = input_name.replace('.csv', f'_{member}.csv')
