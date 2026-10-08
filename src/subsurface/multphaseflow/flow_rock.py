@@ -490,8 +490,9 @@ class flow_rock(flow):
             self.pem.calc_props(phases, saturations, pem_input['PRESSURE'], pem_input['PORO'],
                                 dens = densities, ntg=pem_input['NTG'], Rs=pem_input['RS'], press_init=P_init)
 
-    def setup_fwd_run(self, redund_sim):
-        super().setup_fwd_run(redund_sim=redund_sim)
+    def setup_fwd_run(self, **kwargs):
+        # PET calls this with keywords such as `level`; pass them on as flow does
+        super().setup_fwd_run(**kwargs)
 
     def run_fwd_sim(self, state, member_i, del_folder=True):
         # The inherited simulator also has a run_fwd_sim. Call this.
@@ -648,8 +649,9 @@ class flow_sim2seis(flow):
         else:
             self.pem = None
 
-    def setup_fwd_run(self):
-        super().setup_fwd_run()
+    def setup_fwd_run(self, **kwargs):
+        # PET calls this with keywords such as `level`; pass them on as flow does
+        super().setup_fwd_run(**kwargs)
 
     def run_fwd_sim(self, state, member_i, del_folder=True):
         # The inherited simulator also has a run_fwd_sim. Call this.
@@ -792,8 +794,9 @@ class flow_barycenter(flow):
         else:
             self.pem = None
 
-    def setup_fwd_run(self, redund_sim):
-        super().setup_fwd_run(redund_sim=redund_sim)
+    def setup_fwd_run(self, **kwargs):
+        # PET calls this with keywords such as `level`; pass them on as flow does
+        super().setup_fwd_run(**kwargs)
 
     def run_fwd_sim(self, state, member_i, del_folder=True):
         # The inherited simulator also has a run_fwd_sim. Call this.

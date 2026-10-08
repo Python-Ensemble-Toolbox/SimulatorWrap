@@ -22,8 +22,10 @@ dependencies = [
   "pandas",
   "resdata",
   "resfo_utilities",
-#  "libecalc==8.23.1", # pin version to avoid frequent modifications
 ]
+
+[project.optional-dependencies]
+ecalc = ["libecalc>=15,<16"]  # for facilities.ecalc; install with: pip install -e .[ecalc]
 
 [project.urls]
 Homepage = "https://github.com/Python-Ensemble-Toolbox/SimulatorWrap"

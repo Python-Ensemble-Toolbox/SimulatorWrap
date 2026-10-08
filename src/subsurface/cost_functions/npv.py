@@ -18,7 +18,7 @@ __all__ = ['npv']
 def npv(data: pd.DataFrame, **kwargs):
     # --- Extract economic parameters and scaling factor ---
     input_dict = kwargs.get("input_dict", {})
-    econ_prms = DEFAULT_ECON
+    econ_prms = DEFAULT_ECON.copy()
     econ_prms.update(input_dict.get("npv_const", {}))
     scaling_factor = econ_prms.pop("obj_scaling", 1.0)
     
@@ -28,8 +28,9 @@ def npv(data: pd.DataFrame, **kwargs):
     vol_wpr   = _get_column(data, "FWPT").diff()      # Water production volume (Sm3)
     vol_win   = _get_column(data, "FWIT").diff()      # Water injection volume (Sm3)
 
-    co2_rate  = _get_column(data, "FU_CO2R")          # CO2 emission rate (ton/day)
-    fuel_rate = _get_column(data, "FU_FUEL")          # Fuel consumption rate (Sm3/day)
+    # Facility terms, e.g. from subsurface.facilities.ecalc.Ecalc; zero when the simulator does not report them
+    co2_rate  = _get_column(data, "FU_CO2R", optional=True)   # CO2 emission rate (ton/day)
+    fuel_rate = _get_column(data, "FU_FUEL", optional=True)   # Fuel consumption rate (Sm3/day)
     dt = data.index.to_series().diff().dt.days
     co2_mass  = co2_rate * dt                              # CO2 mass (ton/day)
     fuel_mass = fuel_rate * dt                             # Fuel mass (Sm3/day)
@@ -57,11 +58,13 @@ def npv(data: pd.DataFrame, **kwargs):
     discounted_npv = (revenue - costs) / discount_factor
     
     # --- Return scaled NPV ---
-    return discounted_npv.sum() / scaling_factor
+    # The first report date starts the first step and has no cash flow of its own. Its terms are NaN
+    # (or arrays of NaN, one per member, for ensemble data), so it is left out rather than skipped by sum.
+    return discounted_npv.iloc[1:].sum() / scaling_factor
 
 
 
-def _get_column(data: pd.DataFrame, name: str) -> pd.Series:
+def _get_column(data: pd.DataFrame, name: str, optional: bool = False) -> pd.Series:
     colmap = {c.lower(): c for c in data.columns}
     key = name.lower()
     
@@ -76,7 +79,8 @@ def _get_column(data: pd.DataFrame, name: str) -> pd.Series:
             col = col.fillna(0)
         return col
 
-    warnings.warn(
-        f"Column '{name}' not found (case-insensitive). Returning zeros."
-    )
+    if not optional:
+        warnings.warn(
+            f"Column '{name}' not found (case-insensitive). Returning zeros."
+        )
     return pd.Series(np.zeros(len(data)), index=data.index)

@@ -133,15 +133,15 @@ class elasticproperties:
             porosity = [porosity]
         #
         # Load "overburden" into local variable to
-        # comply with remaining code parts
-        overburden = self.overburden
+        # comply with remaining code parts. A single value applies to every cell.
+        overburden = np.broadcast_to(self.overburden, np.shape(pressure))
 
         if press_init is None:
             p_init = self.p_init
         else:
             p_init = press_init
         #
-        poverburden = self.overburden
+        poverburden = overburden
 
         # debug
         self.pressure = pressure
