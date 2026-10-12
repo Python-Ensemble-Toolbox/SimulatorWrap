@@ -38,6 +38,20 @@ from CoolProp.CoolProp import PropsSI  # http://coolprop.org/#high-level-interfa
 
 class mixIn_multi_data():
 
+    def _ensure_dir_for_writes(self, path):
+        """Create directory if missing; use existing directory directly."""
+        if os.path.isdir(path):
+            return
+        if os.path.islink(path):
+            os.unlink(path)
+        try:
+            os.makedirs(path, exist_ok=True)
+        except FileExistsError:
+            if not os.path.isdir(path):
+                raise NotADirectoryError(
+                    f"Expected directory at '{path}', but found a non-directory path."
+                )
+
     def find_cell_centre(self, grid):
         # Find indices where the boolean array is True
         indices = np.where(grid['ACTNUM'])
@@ -89,7 +103,7 @@ class mixIn_multi_data():
 
         return water_depths
 
-    def measurement_locations(self, grid, water_depth, pad=1500, dxy=3000, well_coord = None, r0 = 5000):
+    def measurement_locations(self, grid, water_depth, pad=500, dxy=3000, well_coord = None, r0 = 5000):
 
         # Determine the size of the measurement area as defined by the field extent
         cell_centre = self.find_cell_centre(grid)
@@ -240,6 +254,7 @@ class flow_rock(flow):
     def __init__(self, input_dict=None, filename=None, options=None):
         super().__init__(input_dict)
         self._getpeminfo(input_dict)
+        self._get_plume_info(input_dict)
 
         self.date_slack = None
         if 'date_slack' in input_dict:
@@ -260,6 +275,7 @@ class flow_rock(flow):
         # Store dynamic variables in case they are provided in the state
         self.state = None
         self.no_flow = False
+        self.plume_result = []
 
     def _getpeminfo(self, input_dict):
         """
@@ -311,6 +327,62 @@ class flow_rock(flow):
 
         else:
             self.pem = None
+
+    def _get_plume_info(self, input_dict):
+        """Parse optional plume-extent export settings.
+
+        The export is intentionally independent of the assimilated data type; it
+        only needs a list of vintages/times and a saturation field name.
+        """
+        if not input_dict:
+            self.plume_config = None
+            return
+
+        plume_key = None
+        if 'plume_extent' in input_dict:
+            plume_key = 'plume_extent'
+        elif 'plume' in input_dict:
+            plume_key = 'plume'
+
+        if plume_key is None:
+            self.plume_config = None
+            return
+
+        self.plume_config = {}
+        config_para_list = ['vintage', 'phase', 'field', 'threshold', 'reduce']
+        for elem in input_dict[plume_key]:
+            assert elem[0] in config_para_list, f'Property {elem[0]} not supported'
+            if elem[0] == 'vintage' and not isinstance(elem[1], list):
+                elem[1] = [elem[1]]
+            self.plume_config[elem[0]] = elem[1]
+
+        self.plume_config['phase'] = str(self.plume_config.get('phase', 'posterior')).lower()
+        self.plume_config['field'] = str(self.plume_config.get('field', 'SGAS')).upper()
+        self.plume_config['reduce'] = str(self.plume_config.get('reduce', 'max')).lower()
+        self.plume_config['threshold'] = float(self.plume_config.get('threshold', 0.05))
+
+    @staticmethod
+    def _get_grid_coordinates(grid):
+        """Return grid-cell center coordinates from an ECLIPSE grid."""
+        coord = grid['COORD']
+        nx = coord.shape[0] - 1
+        ny = coord.shape[1] - 1
+
+        x_centers = np.zeros((nx, ny))
+        y_centers = np.zeros((nx, ny))
+
+        for i in range(nx):
+            for j in range(ny):
+                x_centers[i, j] = 0.25 * (
+                    coord[i, j, 0, 0] + coord[i + 1, j, 0, 0] +
+                    coord[i, j + 1, 0, 0] + coord[i + 1, j + 1, 0, 0]
+                )
+                y_centers[i, j] = 0.25 * (
+                    coord[i, j, 0, 1] + coord[i + 1, j, 0, 1] +
+                    coord[i, j + 1, 0, 1] + coord[i + 1, j + 1, 0, 1]
+                )
+
+        return x_centers, y_centers
 
     def _get_pem_input(self, type, time=None):
         if self.no_flow:  # get variable from state
@@ -970,8 +1042,12 @@ class flow_avo(flow_rock, mixIn_multi_data):
     def __init__(self, input_dict=None, filename=None, options=None, **kwargs):
         super().__init__(input_dict, filename, options)
 
-        assert 'avo' in input_dict, 'To do AVO simulation, please specify an "AVO" section in the "FWDSIM" part'
-        self._get_avo_info()
+        # Allow graceful skipping if AVO config not present (for staged DA with subset of datatypes)
+        if 'avo' in input_dict:
+            self._get_avo_info()
+        else:
+            # Initialize empty AVO attributes so methods can check if AVO is active
+            self.avo_input = {}
 
     def setup_fwd_run(self,  **kwargs):
         self.__dict__.update(kwargs)
@@ -1069,6 +1145,29 @@ class flow_avo(flow_rock, mixIn_multi_data):
             roi_mask = np.repeat(roi_mask[:, :, :, np.newaxis], avo_shape[3], axis=3)
         return roi_mask
 
+    @staticmethod
+    def _crop_mask_to_bbox(mask):
+        """Crop a boolean mask to the minimal bounding box that contains active cells.
+
+        Returns
+        -------
+        cropped_mask : np.ndarray
+            Cropped boolean mask.
+        bbox : np.ndarray
+            Array with shape (ndim, 2), storing inclusive [start, stop] indices in
+            the original mask for each axis.
+        """
+        mask = np.asarray(mask).astype(bool)
+        if not np.any(mask):
+            raise ValueError("Cannot crop empty wavelet mask.")
+
+        active = np.argwhere(mask)
+        start = np.min(active, axis=0)
+        stop = np.max(active, axis=0)
+        slicer = tuple(slice(int(lo), int(hi) + 1) for lo, hi in zip(start, stop))
+        bbox = np.stack([start, stop], axis=1).astype(int)
+        return mask[slicer], bbox
+
     def get_avo_result(self, folder, save_folder):
 
         if self.no_flow:
@@ -1106,6 +1205,24 @@ class flow_avo(flow_rock, mixIn_multi_data):
             raise ValueError(f"Invalid AVO sampling steps: step_x={step_x}, step_y={step_y}. Both must be >= 1.")
 
         baseline_mode = str(self.avo_config.get('baseline_mode', 'fixed')).lower()
+        time_lapse_sampling_mode = str(self.avo_config.get('time_lapse_sampling_mode', 'legacy')).lower()
+        debug_masks = bool(self.avo_config.get('debug_masks', False))
+
+        def _print_mask_stats(tag, active_mask, sample_mask, roi_mask, final_mask):
+            if not debug_masks:
+                return
+            total = int(np.size(final_mask))
+            active_n = int(np.count_nonzero(active_mask))
+            sample_n = int(np.count_nonzero(sample_mask))
+            roi_n = int(np.count_nonzero(roi_mask))
+            final_n = int(np.count_nonzero(final_mask))
+            print(
+                f"[avo-mask] {tag}: total={total} "
+                f"active={active_n} ({active_n / total:.3%}) "
+                f"sample={sample_n} ({sample_n / total:.3%}) "
+                f"roi={roi_n} ({roi_n / total:.3%}) "
+                f"final={final_n} ({final_n / total:.3%})"
+            )
 
         def _build_active_mask(actnum, avo_shape):
             """Build an active-trace mask aligned with the first 2 AVO axes."""
@@ -1166,11 +1283,12 @@ class flow_avo(flow_rock, mixIn_multi_data):
 
              return x_centers, y_centers
 
-        def _load_completion_ij(data_file):
-             """Read COMPDAT completion I/J pairs (0-based) from a DATA deck."""
+        def _load_well_completions(data_file):
+             """Read WELSPECS groups and COMPDAT completion I/J pairs (0-based)."""
              if not os.path.exists(data_file):
-                 return []
-             out = []
+                 return {}, []
+             well_groups = {}
+             completions = []
              section = None
              with open(data_file, 'r', errors='ignore') as fh:
                  for raw in fh:
@@ -1181,19 +1299,30 @@ class flow_avo(flow_rock, mixIn_multi_data):
                      if up.startswith('COMPDAT'):
                          section = 'COMPDAT'
                          continue
+                     if up.startswith('WELSPECS'):
+                         section = 'WELSPECS'
+                         continue
                      if line == '/':
                          section = None
                          continue
+                     toks = line.replace('/', ' ').strip().split()
+                     if section == 'WELSPECS':
+                         if len(toks) < 4:
+                             continue
+                         wname = toks[0].strip("'\"")
+                         wgroup = toks[1].strip("'\"")
+                         well_groups[wname] = wgroup
+                         continue
                      if section != 'COMPDAT':
                          continue
-                     toks = line.replace('/', ' ').strip().split()
                      if len(toks) < 3:
                          continue
                      try:
-                         out.append((int(toks[1]) - 1, int(toks[2]) - 1))
+                         wname = toks[0].strip("'\"")
+                         completions.append((wname, int(toks[1]) - 1, int(toks[2]) - 1))
                      except ValueError:
                          continue
-             return out
+             return well_groups, completions
         
         def _build_roi_mask(avo_cube):
              """Build optional ROI mask for assimilation.
@@ -1245,10 +1374,27 @@ class flow_avo(flow_rock, mixIn_multi_data):
              if roi_mode not in ('none', 'off', 'all'):
                  # Build seed points from well completions.
                  data_path = folder + os.sep + self.file + '.DATA' if folder[-1] != os.sep else folder + self.file + '.DATA'
-                 completion_ij = _load_completion_ij(data_path)
+                 well_groups, completion_ij = _load_well_completions(data_path)
+                 seed_mode = str(self.avo_config.get('roi_seed_wells', 'injectors')).lower()
+                 if seed_mode not in ('injectors', 'all'):
+                     raise ValueError(
+                         f"Invalid AVO config: roi_seed_wells={seed_mode}. Expected 'injectors' or 'all'."
+                     )
+
+                 inj_keywords = ('INJ', 'INJECT', 'CO2', 'STOR')
+
+                 def _is_injector(wname):
+                     grp = str(well_groups.get(wname, '')).upper()
+                     nm = str(wname).upper()
+                     return any(k in grp for k in inj_keywords) or any(k in nm for k in inj_keywords)
+
                  seed_x = []
                  seed_y = []
-                 for i_idx, j_idx in completion_ij:
+                 selected_wells = set()
+                 for wname, i_idx, j_idx in completion_ij:
+                     if seed_mode == 'injectors' and not _is_injector(wname):
+                         continue
+                     selected_wells.add(str(wname))
                      if use_ji:
                          if 0 <= j_idx < nx and 0 <= i_idx < ny:
                              seed_x.append(float(x_grid[j_idx, i_idx]))
@@ -1257,6 +1403,26 @@ class flow_avo(flow_rock, mixIn_multi_data):
                          if 0 <= i_idx < nx and 0 <= j_idx < ny:
                              seed_x.append(float(x_grid[i_idx, j_idx]))
                              seed_y.append(float(y_grid[i_idx, j_idx]))
+
+                 # If no injector completions were found, fallback to all wells.
+                 if seed_mode == 'injectors' and len(seed_x) == 0 and len(completion_ij) > 0:
+                     for wname, i_idx, j_idx in completion_ij:
+                         selected_wells.add(str(wname))
+                         if use_ji:
+                             if 0 <= j_idx < nx and 0 <= i_idx < ny:
+                                 seed_x.append(float(x_grid[j_idx, i_idx]))
+                                 seed_y.append(float(y_grid[j_idx, i_idx]))
+                         else:
+                             if 0 <= i_idx < nx and 0 <= j_idx < ny:
+                                 seed_x.append(float(x_grid[i_idx, j_idx]))
+                                 seed_y.append(float(y_grid[i_idx, j_idx]))
+
+                 if debug_masks:
+                     if selected_wells:
+                         mode_used = seed_mode if len(seed_x) > 0 else 'all(fallback)'
+                         print(f"[avo-mask] roi_seed_wells={mode_used}, wells={sorted(selected_wells)}")
+                     else:
+                         print("[avo-mask] roi_seed_wells: no COMPDAT wells parsed; falling back to active envelope")
 
                  # Add strong AVO-signal points so ROI follows saturation-change-sensitive area.
                  if use_signal and np.ndim(avo_cube) >= 3:
@@ -1269,8 +1435,9 @@ class flow_avo(flow_rock, mixIn_multi_data):
                              seed_x.append(float(x_grid[a, b]))
                              seed_y.append(float(y_grid[a, b]))
 
-                 # Fallback to active grid envelope if seeds are sparse.
-                 if len(seed_x) < 2:
+                 # Fallback to active grid envelope only when no well seed exists.
+                 # A single injector completion should still define a local ROI.
+                 if len(seed_x) == 0:
                      actnum_bool = np.asarray(actnum).astype(bool)
                      active_indices = np.where(np.any(actnum_bool, axis=0))
                      if len(active_indices[0]) > 0:
@@ -1333,16 +1500,70 @@ class flow_avo(flow_rock, mixIn_multi_data):
              return roi_mask
 
         def _save_wavelet_mask(mask, vintage_idx):
-             """Save compress-ready 3D mask that matches current AVO vectorization."""
+             """Save compress-ready 3D mask that matches current AVO vectorization.
+
+             If avo.wavelet_mask_mode == 'bbox', the mask is cropped to the minimal
+             active bounding box before saving. This avoids wavelet compression over
+             the full inactive volume and typically gives much more reasonable noise
+             estimates / thresholds for sparse 4D AVO responses.
+             """
              mask = np.asarray(mask, dtype=bool)
              if mask.ndim == 4:
-                 nx, ny, nt, n_ang = mask.shape
-                 mask_3d = mask.reshape(nx, ny, nt * n_ang)
+                  nx, ny, nt, n_ang = mask.shape
+                  mask_3d = mask.reshape(nx, ny, nt * n_ang)
              elif mask.ndim == 3:
-                 mask_3d = mask
+                  mask_3d = mask
              else:
-                 return
-             np.savez(f'mask_{vintage_idx}_3d.npz', mask=mask_3d)
+                  return
+
+             mask_mode = str(self.avo_config.get('wavelet_mask_mode', 'full')).lower()
+             save_dict = {
+                  'full_shape': np.array(mask_3d.shape, dtype=int),
+             }
+
+             if mask_mode == 'bbox':
+                  mask_3d, bbox = self._crop_mask_to_bbox(mask_3d)
+                  save_dict['bbox'] = bbox
+                  save_dict['compress_dim'] = np.array(mask_3d.shape, dtype=int)
+             elif mask_mode not in ('full', 'none', 'off'):
+                  raise ValueError(
+                      f"Invalid AVO config: wavelet_mask_mode={mask_mode}. Supported values are 'full' and 'bbox'."
+                  )
+
+             save_dict['mask'] = mask_3d
+             mask_3d_path = os.path.join(mask_output_dir, f'mask_{vintage_idx}_3d.npz')
+             if os.path.islink(mask_3d_path):
+                  os.unlink(mask_3d_path)
+             np.savez(mask_3d_path, **save_dict)
+
+        def _resolve_mask_output_dir():
+             """Pick a stable directory for mask artifacts used by wavelet compression/debugging."""
+             candidates = []
+             if save_folder is not None:
+                  candidates.append(str(save_folder))
+             if folder is not None:
+                  abs_folder = os.path.abspath(str(folder))
+                  candidates.extend([os.path.dirname(abs_folder), abs_folder])
+             try:
+                  candidates.append(os.getcwd())
+             except FileNotFoundError:
+                  pass
+
+             for cand in candidates:
+                  if cand is None or cand == '':
+                       continue
+                  try:
+                       self._ensure_dir_for_writes(cand)
+                       return cand
+                  except OSError:
+                       continue
+
+             raise FileNotFoundError(
+                  "Could not resolve writable output directory for AVO mask files. "
+                  f"folder={folder!r}, save_folder={save_folder!r}"
+             )
+
+        mask_output_dir = _resolve_mask_output_dir()
         if 'baseline' in self.pem_input:  # 4D measurement
             base_time = dt.datetime(self.startDate['year'], self.startDate['month'],
                                     self.startDate['day']) + dt.timedelta(days=self.pem_input['baseline'])
@@ -1355,6 +1576,9 @@ class flow_avo(flow_rock, mixIn_multi_data):
             if not self.no_flow:
                 # vp, vs, density in reservoir
                 vp, vs, rho = self.calc_velocities(folder, save_folder, grid, 0, f_dim)
+                vp_cells_baseline = np.array(vp, copy=True)
+                vs_cells_baseline = np.array(vs, copy=True)
+                rho_cells_baseline = np.array(rho, copy=True)
 
                 # avo data
                 # self._calc_avo_props()
@@ -1373,6 +1597,7 @@ class flow_avo(flow_rock, mixIn_multi_data):
                     np.logical_and(baseline_active_mask, baseline_sample_mask),
                     baseline_roi_mask
                 )
+
                 if not np.any(baseline_structural_mask):
                     raise ValueError("Baseline AVO mask is empty; check ACTNUM orientation and AVO geometry.")
                 #rho_baseline = rho_sample
@@ -1386,9 +1611,17 @@ class flow_avo(flow_rock, mixIn_multi_data):
                 rolling_ref_Rpp = Rpp_baseline
                 rolling_ref_vs = vs_baseline
                 rolling_ref_vp = vp_baseline
+                rolling_ref_vp_cells = vp_cells_baseline
+                rolling_ref_vs_cells = vs_cells_baseline
+                rolling_ref_rho_cells = rho_cells_baseline
+                rolling_ref_registered = None
                 rolling_ref_PRESSURE = PRESSURE_baseline
                 rolling_ref_SGAS = SGAS_baseline
                 rolling_ref_structural_mask = baseline_structural_mask
+                if time_lapse_sampling_mode == 'cell_difference_reference_time':
+                    rolling_ref_registered = self._build_reference_time_avo_products(
+                        grid, vp_cells_baseline, vs_cells_baseline, rho_cells_baseline, dz, zcorn
+                    )
 
             else:
                 file_name = f"avo_vint0_{folder}.npz" if folder[-1] != os.sep \
@@ -1411,6 +1644,9 @@ class flow_avo(flow_rock, mixIn_multi_data):
 
             # vp, vs, density in reservoir
             vp, vs, rho = self.calc_velocities(folder, save_folder, grid, v+1, f_dim)
+            vp_cells = np.array(vp, copy=True)
+            vs_cells = np.array(vs, copy=True)
+            rho_cells = np.array(rho, copy=True)
 
             # avo data
             #self._calc_avo_props()
@@ -1431,9 +1667,13 @@ class flow_avo(flow_rock, mixIn_multi_data):
                 np.logical_and(active_mask, sample_mask),
                 roi_mask
             )
+            _print_mask_stats(f"vintage_{v}", active_mask, sample_mask, roi_mask, mask)
             if not np.any(mask):
                 raise ValueError("AVO mask is empty; check ACTNUM orientation and AVO geometry.")
-            np.savez(f'mask_{v}.npz', mask=mask)
+            mask_2d_path = os.path.join(mask_output_dir, f'mask_{v}.npz')
+            if os.path.islink(mask_2d_path):
+                os.unlink(mask_2d_path)
+            np.savez(mask_2d_path, mask=mask)
             _save_wavelet_mask(mask, v)
             avo = np.where(np.isfinite(avo_data), avo_data, 0.0)[mask]
             if avo.size == 0:
@@ -1452,6 +1692,10 @@ class flow_avo(flow_rock, mixIn_multi_data):
                     ref_Rpp = rolling_ref_Rpp
                     ref_vs = rolling_ref_vs
                     ref_vp = rolling_ref_vp
+                    ref_vp_cells = rolling_ref_vp_cells
+                    ref_vs_cells = rolling_ref_vs_cells
+                    ref_rho_cells = rolling_ref_rho_cells
+                    ref_registered = rolling_ref_registered
                     ref_PRESSURE = rolling_ref_PRESSURE
                     ref_SGAS = rolling_ref_SGAS
                     ref_structural_mask = rolling_ref_structural_mask
@@ -1460,6 +1704,10 @@ class flow_avo(flow_rock, mixIn_multi_data):
                     ref_Rpp = Rpp_baseline
                     ref_vs = vs_baseline
                     ref_vp = vp_baseline
+                    ref_vp_cells = vp_cells_baseline
+                    ref_vs_cells = vs_cells_baseline
+                    ref_rho_cells = rho_cells_baseline
+                    ref_registered = None
                     ref_PRESSURE = PRESSURE_baseline
                     ref_SGAS = SGAS_baseline
                     ref_structural_mask = baseline_structural_mask
@@ -1476,17 +1724,45 @@ class flow_avo(flow_rock, mixIn_multi_data):
                 avo = delta_avo[valid_mask]
                 if avo.size == 0:
                     raise ValueError("4D AVO selection is empty after baseline subtraction and masking.")
-                Rpp = Rpp - ref_Rpp
-                vs_sample = vs_sample - ref_vs
-                vp_sample = vp_sample - ref_vp
+                if debug_masks:
+                    valid_n = int(np.count_nonzero(valid_mask))
+                    valid_total = int(np.size(valid_mask))
+                    avo_abs = np.abs(avo)
+                    print(
+                        f"[avo-mask] vintage_{v}: valid_4d={valid_n} ({valid_n / valid_total:.3%}), "
+                        f"abs(avo) p95={np.nanpercentile(avo_abs, 95):.3e}, p99={np.nanpercentile(avo_abs, 99):.3e}"
+                    )
+                legacy_Rpp = Rpp
+                if time_lapse_sampling_mode == 'cell_difference_reference_time':
+                    cur_registered = self._build_reference_time_avo_products(
+                        grid, vp_cells, vs_cells, rho_cells, dz, zcorn
+                    )
+                    ref_products = ref_registered
+                    if ref_products is None:
+                        ref_products = self._build_reference_time_avo_products(
+                            grid, ref_vp_cells, ref_vs_cells, ref_rho_cells, dz, zcorn
+                        )
+                    vp_sample = cur_registered['vp_sample'] - ref_products['vp_sample']
+                    vs_sample = cur_registered['vs_sample'] - ref_products['vs_sample']
+                    Rpp = cur_registered['Rpp'] - ref_products['Rpp']
+                    avo_data_delta_spatial = cur_registered['avo_data'] - ref_products['avo_data']
+                    avo = np.where(np.isfinite(avo_data_delta_spatial), avo_data_delta_spatial, 0.0)[valid_mask]
+                else:
+                    Rpp = Rpp - ref_Rpp
+                    vs_sample = vs_sample - ref_vs
+                    vp_sample = vp_sample - ref_vp
                 PRESSURE = PRESSURE - ref_PRESSURE
                 SGAS = SGAS - ref_SGAS
 
                 if baseline_mode == 'rolling':
                     rolling_ref_avo_data = np.copy(avo_data)
-                    rolling_ref_Rpp = np.copy(Rpp + ref_Rpp)
+                    rolling_ref_Rpp = np.copy(legacy_Rpp)
                     rolling_ref_vs = np.copy(vs_sample + ref_vs)
                     rolling_ref_vp = np.copy(vp_sample + ref_vp)
+                    rolling_ref_vp_cells = np.copy(vp_cells)
+                    rolling_ref_vs_cells = np.copy(vs_cells)
+                    rolling_ref_rho_cells = np.copy(rho_cells)
+                    rolling_ref_registered = cur_registered if time_lapse_sampling_mode == 'cell_difference_reference_time' else None
                     rolling_ref_PRESSURE = np.copy(PRESSURE + ref_PRESSURE)
                     rolling_ref_SGAS = np.copy(SGAS + ref_SGAS)
                     rolling_ref_structural_mask = np.copy(mask)
@@ -1532,11 +1808,86 @@ class flow_avo(flow_rock, mixIn_multi_data):
                 #np.savez(file_name_rec, **save_dic)
                 # with open(file_name, "wb") as f:
                 #    dump(**save_dic, f)
+            self._ensure_dir_for_writes(os.path.dirname(os.path.abspath(file_name)))
             np.savez(file_name, **save_dic)
         # 4D response
         self.avo_result = []
         for i, elem in enumerate(vintage):
             self.avo_result.append(elem)
+
+    def get_plume_result(self, folder, save_folder):
+        """Export reduced CO2 plume footprints for configured vintages.
+
+        The output is a compact 2D map (maximum saturation over depth) written
+        per ensemble member so prior/posterior sets can be compared later without
+        retaining the full 3D simulator state in memory.
+        """
+        if not getattr(self, 'plume_config', None):
+            return
+
+        vintages = self.plume_config.get('vintage', [])
+        if len(vintages) == 0:
+            return
+
+        field_key = self.plume_config.get('field', 'SGAS')
+        phase = self.plume_config.get('phase', 'posterior')
+        reduce_method = self.plume_config.get('reduce', 'max')
+
+        if self.no_flow:
+            grid_file = self.pem.input['grid']
+            grid = np.load(grid_file)
+            actnum = grid['ACTNUM']
+            f_dim = [grid['DIMENS'][2], grid['DIMENS'][1], grid['DIMENS'][0]]
+        else:
+            self.ecl_case = ecl.EclipseCase(folder + os.sep + self.file + '.DATA') if folder[-1] != os.sep \
+                else ecl.EclipseCase(folder + self.file + '.DATA')
+            grid = self.ecl_case.grid()
+            ecl_init = ecl.EclipseInit(folder + os.sep + self.file + '.DATA') if folder[-1] != os.sep \
+                else ecl.EclipseInit(folder + self.file + '.DATA')
+            actnum = ecl_init.grid.actnum
+            f_dim = [ecl_init.nk, ecl_init.nj, ecl_init.ni]
+
+        true_indices = np.where(actnum)
+        member_tag = getattr(self, 'ensemble_member', -1)
+        plume_results = []
+
+        for v, time in enumerate(vintages):
+            sat = np.asarray(self._get_pem_input(field_key, time), dtype=float)
+            sat3d = np.full(f_dim, np.nan)
+            sat3d[true_indices] = sat
+
+            if reduce_method == 'max':
+                plume_2d = np.nanmax(sat3d, axis=0)
+            elif reduce_method == 'mean':
+                plume_2d = np.nanmean(sat3d, axis=0)
+            else:
+                raise ValueError(
+                    f"Unsupported plume reduce method '{reduce_method}'. Expected 'max' or 'mean'."
+                )
+
+            plume_results.append(plume_2d)
+
+            save_dic = {
+                'plume': plume_2d,
+                'field': field_key,
+                'phase': phase,
+                'threshold': float(self.plume_config.get('threshold', 0.05)),
+                'vintage': time,
+            }
+            try:
+                x_grid, y_grid = self._get_grid_coordinates(grid)
+                save_dic['x_grid'] = x_grid
+                save_dic['y_grid'] = y_grid
+            except Exception:
+                pass
+
+            base_dir = str(save_folder) if save_folder is not None else 'Ensemble_results'
+            file_name = base_dir + os.sep + f"plume_{phase}_vint{v}_En_{member_tag}.npz" if base_dir[-1] != os.sep \
+                else base_dir + f"plume_{phase}_vint{v}_En_{member_tag}.npz"
+            self._ensure_dir_for_writes(os.path.dirname(os.path.abspath(file_name)))
+            np.savez(file_name, **save_dic)
+
+        self.plume_result = plume_results
 
     def calc_velocities(self, folder, save_folder, grid, v, f_dim):
         # The properties in pem are only given in the active cells
@@ -1612,7 +1963,9 @@ class flow_avo(flow_rock, mixIn_multi_data):
          config_para_list = ['dz', 'tops', 'angle', 'frequency', 'wave_len', 'vp_shale', 'vs_shale',
                              'den_shale', 't_min', 't_max', 't_sampling', 'pp_func',
                              'step_x', 'step_y', 'x_range', 'y_range', 'roi_mask_file', 'baseline_mode',
-                             'use_ellipse', 'roi_mode', 'roi_margin_m', 'roi_signal_percentile', 'roi_use_signal']
+                             'use_ellipse', 'roi_mode', 'roi_margin_m', 'roi_signal_percentile',
+                             'time_lapse_sampling_mode',
+                             'roi_use_signal', 'roi_seed_wells', 'wavelet_mask_mode', 'debug_masks']
          if 'avo' in self.input_dict:
              self.avo_config = {}
              for elem in self.input_dict['avo']:
@@ -1641,6 +1994,16 @@ class flow_avo(flow_rock, mixIn_multi_data):
                      f"Invalid AVO config: baseline_mode={self.avo_config['baseline_mode']}. "
                      "Expected 'fixed' or 'rolling'."
                  )
+
+             self.avo_config['time_lapse_sampling_mode'] = str(
+                 self.avo_config.get('time_lapse_sampling_mode', 'legacy')
+             ).lower()
+             if self.avo_config['time_lapse_sampling_mode'] not in ('legacy', 'cell_difference_reference_time'):
+                 raise ValueError(
+                     "Invalid AVO config: "
+                     f"time_lapse_sampling_mode={self.avo_config['time_lapse_sampling_mode']}. "
+                     "Expected 'legacy' or 'cell_difference_reference_time'."
+                 )
              
              # ROI selection mode used by assimilation mask builder.
              if 'roi_mode' in self.avo_config:
@@ -1668,6 +2031,12 @@ class flow_avo(flow_rock, mixIn_multi_data):
                      f"Invalid AVO config: roi_signal_percentile={self.avo_config['roi_signal_percentile']}. "
                      "Must be in [0, 100]."
                  )
+
+             # Optional diagnostics for mask coverage and selected 4D AVO amplitudes.
+             dbg = self.avo_config.get('debug_masks', False)
+             if isinstance(dbg, str):
+                 dbg = dbg.lower() in ('1', 'true', 'yes', 'on')
+             self.avo_config['debug_masks'] = bool(dbg)
 
              # self._get_DZ(file=self.avo_config['dz'])  # =>self.DZ
              kw_file = {'DZ': self.avo_config['dz'], 'TOPS': self.avo_config['tops']}
@@ -1839,6 +2208,9 @@ class flow_avo(flow_rock, mixIn_multi_data):
         # cum_time = np.concat enate((top_res[:, :, np.newaxis], cum_time_res), axis=2)
         cum_time = np.concatenate((top_res[np.newaxis, :, :], cum_time_res, underburden[np.newaxis, :, :]), axis=0)
 
+        #print(min(cum_time_res.flatten()), max(cum_time_res.flatten()), min(top_res.flatten()), max(top_res.flatten()))
+
+
         # add overburden and underburden values for  Vp, Vs and Density
         vp = np.concatenate((vp_shale * np.ones((1, self.NY, self.NX)),
                              vp, vp_shale * np.ones((1, self.NY, self.NX))), axis=0)
@@ -1857,6 +2229,7 @@ class flow_avo(flow_rock, mixIn_multi_data):
         # search for the lowest grid cell thickness and sample the time according to
         # that grid thickness to preserve the thin layer effect
         time_sample = np.arange(self.avo_config['t_min'], self.avo_config['t_max'], dt)
+        #print(self.avo_config['t_min'], self.avo_config['t_max'], dt, time_sample.shape)
         if time_sample.shape[0] == 1:
             time_sample = time_sample.reshape(-1)
         time_sample = np.tile(time_sample, (len(indices), 1))
@@ -1906,7 +2279,7 @@ class flow_avo(flow_rock, mixIn_multi_data):
 
                 # Sample the trace into regular time interval
                 f = interp1d(np.squeeze(t[ind, :]), np.squeeze(w_trace),
-                             kind='nearest', fill_value='extrapolate')
+                             kind='linear', fill_value='extrapolate')
                 trace_interp[ind, :] = f(t_interp)
 
             if i == 0:
@@ -1939,6 +2312,120 @@ class flow_avo(flow_rock, mixIn_multi_data):
 
         return avo_data, Rpp, vp_sample, vs_sample, rho_sample
 
+    def _sample_active_cells_to_reference_time(self, grid, field, dz, zcorn, reference_vp, dt=0.0005, fill_value=0.0):
+        vp_shale = self.avo_config['vp_shale']
+
+        actnum = grid['ACTNUM']
+        active_indices = np.where(actnum)
+        _, a, b = active_indices
+        ab = np.column_stack((a, b))
+        _, indices = np.unique(ab, axis=0, return_index=True)
+
+        top_res = 2 * zcorn[0, 0, :, 0, :, 0] / vp_shale
+        cum_time_res = np.cumsum(2 * dz / reference_vp, axis=0) + top_res[np.newaxis, :, :]
+        underburden = top_res + np.nanmax(cum_time_res)
+        cum_time = np.concatenate((top_res[np.newaxis, :, :], cum_time_res, underburden[np.newaxis, :, :]), axis=0)
+
+        pad = np.full((1, self.NY, self.NX), fill_value, dtype=float)
+        field_padded = np.concatenate((pad, field, pad), axis=0)
+
+        time_sample = np.arange(self.avo_config['t_min'], self.avo_config['t_max'], dt)
+        if time_sample.shape[0] == 1:
+            time_sample = time_sample.reshape(-1)
+        time_sample = np.tile(time_sample, (len(indices), 1))
+
+        field_sample = np.zeros((len(indices), time_sample.shape[1]), dtype=float)
+
+        for ind in range(len(indices)):
+            y = a[indices[ind]]
+            x = b[indices[ind]]
+            travel_time = cum_time[:, y, x]
+            for k in range(time_sample.shape[1]):
+                idx = np.searchsorted(travel_time, time_sample[ind, k], side='left')
+                idx = idx if idx < len(travel_time) else len(travel_time) - 1
+                field_sample[ind, k] = field_padded[idx, y, x]
+
+        return field_sample
+
+    def _calc_avo_from_sampled_traces(self, vp_sample, vs_sample, rho_sample, dt=0.0005):
+        wavelet, _, wav_center = ricker(
+            np.arange(0, self.avo_config['wave_len'] - dt, dt),
+            f0=self.avo_config['frequency']
+        )
+
+        t_fine = np.arange(self.avo_config['t_min'], self.avo_config['t_max'], dt)
+        t = np.tile(t_fine[:-1], (vp_sample.shape[0], 1))
+        t_interp = np.arange(self.avo_config['t_min'], self.avo_config['t_max'], self.avo_config['t_sampling'])
+        trace_interp = np.zeros((vp_sample.shape[0], len(t_interp)))
+
+        nz_rpp = vp_sample.shape[1] - 1
+        conv_op = Convolve1D(nz_rpp, h=wavelet, offset=wav_center, dtype="float32")
+
+        avo_data = []
+        Rpp = []
+        for i in range(len(self.avo_config['angle'])):
+            angle = np.atleast_1d(self.avo_config['angle'][i])
+            Rpp = self.pp_func(
+                vp_sample[:, :-1], vs_sample[:, :-1], rho_sample[:, :-1],
+                vp_sample[:, 1:], vs_sample[:, 1:], rho_sample[:, 1:], angle
+            )
+
+            for ind in range(vp_sample.shape[0]):
+                w_trace = conv_op * Rpp[ind, :]
+                f = interp1d(np.squeeze(t[ind, :]), np.squeeze(w_trace), kind='linear', fill_value='extrapolate')
+                trace_interp[ind, :] = f(t_interp)
+
+            if i == 0:
+                avo_data = trace_interp.copy()
+            elif i == 1:
+                avo_data = np.stack((avo_data, trace_interp.copy()), axis=-1)
+            else:
+                avo_data = np.concatenate((avo_data, trace_interp[:, :, np.newaxis].copy()), axis=2)
+
+        return avo_data, Rpp
+
+    def _build_reference_time_avo_products(self, grid, vp_cells, vs_cells, rho_cells, dz, zcorn):
+        rho_sample = self._sample_active_cells_to_reference_time(
+            grid, rho_cells, dz, zcorn, reference_vp=vp_cells, fill_value=self.avo_config['den_shale']
+        )
+        vp_sample = self._sample_active_cells_to_reference_time(
+            grid, vp_cells, dz, zcorn, reference_vp=vp_cells, fill_value=self.avo_config['vp_shale']
+        )
+        vs_sample = self._sample_active_cells_to_reference_time(
+            grid, vs_cells, dz, zcorn, reference_vp=vp_cells, fill_value=self.avo_config['vs_shale']
+        )
+        avo_data, Rpp = self._calc_avo_from_sampled_traces(vp_sample, vs_sample, rho_sample)
+        avo_data_spatial = self._sampled_traces_to_spatial_cube(avo_data, grid)
+        return {
+            'vp_sample': vp_sample,
+            'vs_sample': vs_sample,
+            'rho_sample': rho_sample,
+            'avo_data': avo_data_spatial,
+            'Rpp': Rpp,
+        }
+
+    def _sampled_traces_to_spatial_cube(self, trace_data, grid):
+        actnum = grid['ACTNUM']
+        _, a, b = np.where(actnum)
+        ab = np.column_stack((a, b))
+        unique_rows, indices = np.unique(ab, axis=0, return_index=True)
+
+        ny = self.NY
+        nx = self.NX
+        if trace_data.ndim == 2:
+            out = np.full((ny, nx, trace_data.shape[1]), np.nan)
+            for ind in range(len(unique_rows)):
+                y, x = unique_rows[ind]
+                out[y, x, :] = trace_data[ind, :]
+            return out
+        if trace_data.ndim == 3:
+            out = np.full((ny, nx, trace_data.shape[1], trace_data.shape[2]), np.nan)
+            for ind in range(len(unique_rows)):
+                y, x = unique_rows[ind]
+                out[y, x, :, :] = trace_data[ind, :, :]
+            return out
+        raise ValueError(f"Unsupported trace_data ndim={trace_data.ndim}; expected 2 or 3.")
+
 
     @classmethod
     def _reformat3D_then_flatten(cls, array, flatten=True, order="F"):
@@ -1964,8 +2451,9 @@ class flow_grav(flow_rock, mixIn_multi_data):
         super().__init__(input_dict, filename, options)
 
         self.grav_input = {}
-        assert 'grav' in input_dict, 'To do GRAV simulation, please specify an "GRAV" section in the "FWDSIM" part'
-        self._get_grav_info()
+        # Allow graceful skipping if GRAV config not present (for staged DA with subset of datatypes)
+        if 'grav' in input_dict:
+            self._get_grav_info()
 
     def setup_fwd_run(self,  **kwargs):
         self.__dict__.update(kwargs)
@@ -2083,6 +2571,8 @@ class flow_grav(flow_rock, mixIn_multi_data):
                 file_name = folder + os.sep + f"grav_vint{v}.npz" if folder[-1] != os.sep \
                     else folder + f"grav_vint{v}.npz"
                 prior_folder =  'Prior_ensemble_results'
+                self._ensure_dir_for_writes('Ensemble_results')
+                self._ensure_dir_for_writes(prior_folder)
                 try:
                     files = os.listdir(prior_folder)
                     filename_to_check = f"grav_vint{v}_{folder}.npz"
@@ -2099,6 +2589,7 @@ class flow_grav(flow_rock, mixIn_multi_data):
                         else 'Ensemble_results/' + f"grav_vint{v}_{folder[:-1]}.npz"
                 #np.savez(file_name_rec, **save_dic)
 
+            self._ensure_dir_for_writes(os.path.dirname(os.path.abspath(file_name)))
             np.savez(file_name, **save_dic)
 
             if baseline_mode == 'rolling':
@@ -2354,8 +2845,12 @@ class flow_seafloor_disp(flow_rock, mixIn_multi_data):
     def __init__(self, input_dict=None, filename=None, options=None, **kwargs):
         super().__init__(input_dict, filename, options)
 
-        assert 'sea_disp' in input_dict, 'To do subsidence/uplift simulation, please specify an "SEA_DISP" section in the pipt file'
-        self._get_disp_info()
+        # Allow graceful skipping if SEA_DISP config not present (for staged DA with subset of datatypes)
+        if 'sea_disp' in input_dict:
+            self._get_disp_info()
+        else:
+            # Initialize empty sea_disp attributes so methods can check if sea_disp is active
+            self.disp_input = {}
 
 
     def setup_fwd_run(self,  **kwargs):
@@ -2413,7 +2908,9 @@ class flow_seafloor_disp(flow_rock, mixIn_multi_data):
             water_depth = self.disp_config.get('water_depth', 300)
             if 'water_depth' not in self.disp_config:
                 print('Please specify water depths in input file, using 300 m as default')
-        pos = self.measurement_locations(grid, water_depth, pad, dxy)
+
+        well_coord = self.disp_config.get('well_coord', None)
+        pos = self.measurement_locations(grid, water_depth, pad, dxy, well_coord)
 
         # loop over vintages with gravity acquisitions
         disp_struct = {}
@@ -2458,10 +2955,11 @@ class flow_seafloor_disp(flow_rock, mixIn_multi_data):
             else:
                 file_name = folder + os.sep + f"sea_disp_vint{v}.npz" if folder[-1] != os.sep \
                     else folder + f"sea_disp_vint{v}.npz"
-                file_name_rec = 'Ensemble_results/' + f"sea_disp_vint{v}_{folder}.npz" if folder[-1] != os.sep \
-                    else 'Ensemble_results/' + f"sea_disp_vint{v}_{folder[:-1]}.npz"
-                np.savez(file_name_rec, **save_dic)
+                #file_name_rec = 'Ensemble_results/' + f"sea_disp_vint{v}_{folder}.npz" if folder[-1] != os.sep \
+                #    else 'Ensemble_results/' + f"sea_disp_vint{v}_{folder[:-1]}.npz"
+                #np.savez(file_name_rec, **save_dic)
 
+            self._ensure_dir_for_writes(os.path.dirname(os.path.abspath(file_name)))
             np.savez(file_name, **save_dic)
 
             if baseline_mode == 'rolling':
@@ -2929,7 +3427,7 @@ class flow_seafloor_disp(flow_rock, mixIn_multi_data):
         # list of configuration parameters in the "Grav" section of teh pipt file
         config_para_list = ['baseline', 'vintage', 'method', 'model', 'poisson', 'compressibility',
                             'z_base', 'meas_spacing', 'padding', 'seabed', 'water_depth', 'baseline_mode',
-                            'receiver_trunc_factor', 'geertsma_mode']
+                            'receiver_trunc_factor', 'geertsma_mode', 'well_coord']
 
         if 'sea_disp' in self.input_dict:
             self.disp_config = {}
@@ -2982,17 +3480,6 @@ class flow_multi_data(flow_avo, flow_grav, flow_seafloor_disp):
     def __init__(self, input_dict=None, filename=None, options=None, **kwargs):
         super().__init__(input_dict, filename, options)
 
-        if 'grav' in input_dict.get('datatype', []):
-            assert 'grav' in input_dict, 'To do GRAV simulation, please specify an "GRAV" section in the "FWDSIM" part'
-            self._get_grav_info()
-
-        if 'avo' in input_dict.get('datatype', []):
-            assert 'avo' in input_dict, 'To do AVO simulation, please specify an "AVO" section in the "FWDSIM" part'
-            self._get_avo_info()
-
-        if 'sea_disp' in input_dict.get('datatype', []):
-            assert 'sea_disp' in input_dict, 'To do subsidence/uplift simulation, please specify an "SEA_DISP" section in the "FWDSIM" part'
-            self._get_disp_info()
 
     def setup_fwd_run(self,  **kwargs):
         self.__dict__.update(kwargs)
@@ -3029,6 +3516,7 @@ class flow_multi_data(flow_avo, flow_grav, flow_seafloor_disp):
             if 'sea_disp' in self.all_data_types:
                 # calculate gravity data based on flow simulation output
                 self.get_displacement_result(folder, save_folder)
+            self.get_plume_result(folder, save_folder)
 
         return success
 
@@ -3055,4 +3543,3 @@ class flow_multi_data(flow_avo, flow_grav, flow_seafloor_disp):
                     if self.true_prim[1][prim_ind] in self.disp_config['vintage']:
                         v = self.disp_config['vintage'].index(self.true_prim[1][prim_ind])
                         self.pred_data[prim_ind][key] = self.disp_result[v].flatten()
-
