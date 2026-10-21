@@ -128,10 +128,12 @@ class flow(eclipse):
 
         # Extract mpi flag from kwargs
         mpi = kwargs.get("mpi", None)
-        mpi_str = f'"{mpi}"' if mpi is not None else '"mpirun --bind-to none -np 1"'
+        # options['mpi'] defaults to '' (see eclipse.py), so treat any empty value as not given
+        mpi_str = f'"{mpi}"' if mpi else '"mpirun --bind-to none -np 1"'
 
-        # set number of tasks to the number following -np in mpi_str (default is 1)
-        n_tasks = re.search(r"-np (\d+)", mpi_str).group(1)
+        # set number of tasks to the number following -np/-n in mpi_str (default is 1)
+        match = re.search(r"(?:-np|-n)\s+(\d+)", mpi_str)
+        n_tasks = match.group(1) if match else 1
 
         # extract the sim_limit from kwargs. Default is 1 hour
         sim_limit = kwargs.get("sim_limit", None)

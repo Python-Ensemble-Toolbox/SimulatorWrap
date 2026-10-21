@@ -101,9 +101,12 @@ def ecalc_npv_par(pred_data, **kwargs):
             with Pool(min(n_par, len(failed)), maxtasksperchild=1) as retry_pool:
                 for n, v in zip(failed, retry_pool.map(_safe_objective, failed)):
                     values[n] = v
+            # Members that fail again get NaN; the optimizer skips non-finite members in the gradient
             still_failed = [n for n in indecies if values[n] is None]
             if still_failed:
-                raise RuntimeError(f'eCalc failed for members {still_failed} after retry')
+                print(f'eCalc failed for members {still_failed} after retry, setting their objective to NaN', flush=True)
+                for n in still_failed:
+                    values[n] = np.nan
 
         objective[l].extend(values)
         objective[l] = np.array(objective[l]) / const.get('obj_scaling', 1)
