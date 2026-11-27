@@ -5,7 +5,7 @@ This module provides a Python interface (:class:`JutulDarcy`) for running
 JutulDarcy reservoir simulations from a single configuration dictionary.
 It supports:
 
-* Single or ensemble forward simulations (parallel via :mod:`p_tqdm`).
+* Single or ensemble forward simulations (parallel in spawned worker processes).
 * Input through either a static ``.DATA`` file or a Mako-templated ``.mako``
   file rendered per ensemble member.
 * Flexible result extraction (field and per-well summary keywords) with
@@ -16,6 +16,10 @@ It supports:
   deck makes other quantities depend on the permeability field: a COMPDAT
   connection factor left defaulted (well-index chain rule) and PERMY/PERMZ
   produced by ``COPY`` from PERMX. Both are detected from the deck by default.
+* Weighted adjoints: ``H^T w`` for a weight per datum, in a single adjoint
+  solve per member regardless of the number of data. With
+  ``w = Cd^{-1} (d_obs - d_sim)`` this is the data-misfit term of the
+  log-posterior gradient used by e.g. Stein variational gradient descent.
 
 The wrapper communicates with Julia via :mod:`juliacall`. Heavy Julia state
 is created lazily inside worker processes so the class can be pickled for
@@ -34,10 +38,12 @@ from collections import deque
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Any, Iterable
 from mako.template import Template
-from p_tqdm import p_map
+from multiprocess import get_context
 from tqdm import tqdm
+from .vjp import finite_difference_check, keywords_changed, scalar_seeds, weighted_sums
 
 __author__ = ["Mathias Methlie Nilsen"] # With help from "Claude Opus 4.7"
 __all__ = ["JutulDarcy"]
@@ -73,11 +79,9 @@ PBAR_OPTS: dict[str, Any] = {
     "ascii": "-◼",
 }
 
-#: Summary keywords whose values are cumulative (totals), as opposed to rates.
-CUMULATIVE_KEYS: frozenset[str] = frozenset({
-    "FOPT", "FGPT", "FWPT", "FWLT", "FWIT",
-    "WOPT", "WGPT", "WWPT", "WLPT",
-})
+# Phase production/injection rates and totals in JutulDarcy's summary_key_lookup.
+SURFACE_KEYS = {f"{scope}{phase}{flow}{kind}" for scope in "FW" for phase in "OWGL"
+                for flow in "PI" for kind in "RT"}
 
 VALID_OUTPUT_FORMATS: frozenset[str] = frozenset({"list", "dict", "dataframe"})
 VALID_ADJOINT_MODES: frozenset[str]  = frozenset({"sensitivities", "optimization"})
@@ -137,6 +141,12 @@ PERM_COPY_RTOL: float = 1e-10
 #: survives this comparison came from the Peaceman formula rather than the deck.
 WI_PEACEMAN_RTOL: float = 1e-10
 
+#: Tolerance in seconds for matching a ministep's end time to a report point.
+#: Ministep times are floating-point cumulative sums and can miss the whole
+#: second they belong to by a fraction of a second, while no ministep is
+#: anywhere near this short.
+STEP_TIME_TOL: float = 0.5
+
 #: Julia helpers that JutulDarcy does not expose itself. Defined once per Julia
 #: session by :func:`_ensure_julia_helpers`.
 #:
@@ -163,6 +173,16 @@ WI_PEACEMAN_RTOL: float = 1e-10
 #:     One adjoint sweep against pre-built storage, stopping at `n_steps`. An
 #:     objective that only fires at report step k has zero adjoint contribution
 #:     from every later step, so sweeping them is wasted work.
+#:
+#: ``subsurface_case_arrays``
+#:     Every numeric array of a case that a deck field can reach: the data
+#:     domains, the parameters and the initial state of all its models, by
+#:     ``section/model/name``. `check_chain_rule` compares two cases with it.
+#:
+#: ``subsurface_weighted_well_objective``
+#:     ``sum_i w_i * d_i`` over well data ``d_i`` as one sum objective, so its
+#:     gradient is ``H^T w`` from a single adjoint solve. Entries sharing a well
+#:     and quantity are grouped, so each ministep evaluates that quantity once.
 _JULIA_HELPERS: str = """
 function subsurface_sensitivities_with_wells(case, result, obj)
     sens = Jutul.solve_adjoint_sensitivities(case, result, obj)
@@ -285,6 +305,65 @@ function subsurface_sensitivities_reuse(case, storage, packed, obj, n_steps)
         grad[k, Jutul.associated_entity(pdef)] = rsens[k]
     end
     return (reservoir = grad, models = sens)
+end
+
+function subsurface_case_arrays(case)
+    out = Dict{String, Array{Float64}}()
+    put(key, v) = (v isa AbstractArray{<:Real} && !isempty(v)) ? (out[key] = Float64.(collect(v)); nothing) : nothing
+    walk(prefix, d) = for (k, v) in pairs(d)
+        (v isa AbstractDict || v isa NamedTuple) ? walk("$prefix/$k", v) : put("$prefix/$k", v)
+    end
+    model = case.model
+    models = model isa Jutul.MultiModel ? pairs(model.models) : [:Reservoir => model]
+    for (name, m) in models
+        dd = m.data_domain
+        for k in keys(dd)
+            put("domain/$name/$k", dd[k])
+        end
+    end
+    walk("parameters", model isa Jutul.MultiModel ? case.parameters : Dict(:Reservoir => case.parameters))
+    walk("state0", model isa Jutul.MultiModel ? case.state0 : Dict(:Reservoir => case.state0))
+    return out
+end
+
+function subsurface_weighted_well_objective(wells, targets, is_rate, injectors, times, weights, tol)
+    groups = Dict{Tuple{Symbol, Symbol, Bool, Bool}, Tuple{Vector{Float64}, Vector{Float64}}}()
+    for (w, tgt, r, inj, t, c) in zip(String.(wells), String.(targets), Bool.(collect(is_rate)), Bool.(collect(injectors)),
+                                 Float64.(collect(times)), Float64.(collect(weights)))
+        ts, cs = get!(groups, (Symbol(w), Symbol(tgt), r, inj), (Float64[], Float64[]))
+        push!(ts, t)
+        push!(cs, c)
+    end
+    terms = [
+        (well = k[1], target = getfield(JutulDarcy, k[2]), is_rate = k[3], injector = k[4],
+         times = v[1], weights = v[2])
+        for (k, v) in groups
+    ]
+
+    function weighted_well_objective(model, state, dt, step_info, forces)
+        t = step_info[:time]
+        obj = 0.0
+        for term in terms
+            # A rate datum is the rate over the ministep ending at its report
+            # time; a cumulative datum integrates every ministep up to it.
+            c = 0.0
+            for (tk, wk) in zip(term.times, term.weights)
+                hit = term.is_rate ? abs(t - tk) <= tol : t <= tk + tol
+                hit && (c += wk)
+            end
+            c == 0.0 && continue
+            controls = forces[:Facility].control
+            haskey(controls, term.well) || continue
+            ctrl = controls[term.well]
+            (term.injector ? ctrl isa JutulDarcy.InjectorControl : ctrl isa JutulDarcy.ProducerControl) || continue
+            sgn = term.injector ? 1.0 : -1.0
+            q = JutulDarcy.compute_well_qoi(model, state, forces, term.well, term.target)
+            # Rates are reported in Sm3/day, cumulatives in Sm3.
+            obj += c * sgn * q * (term.is_rate ? si_unit(:day) : dt)
+        end
+        return obj
+    end
+    return weighted_well_objective
 end
 """
 
@@ -1000,7 +1079,7 @@ def well_QOI_objective(wellID: str, phaseID: str, time: Iterable[float],
             obj = julia.seval(
                 f"""
                 function well_QOI_{i}(model, state, dt, step_info, forces)
-                    if step_info[:time] != {sec}
+                    if !isapprox(step_info[:time], {sec}; rtol=1e-9, atol=1e-6)
                         return 0.0
                     end
                     ctrl = forces[:Facility].control[Symbol("{wellID}")]
@@ -1062,6 +1141,18 @@ class JutulDarcy:
 
         - ``adjoints`` : dict
             Objective/parameter spec; enables adjoint computation.
+
+        - ``weighted_adjoint`` : dict
+            ``{"parameters": [...]}``; enables the weighted adjoint ``H^T w``
+            for the weights given by ``adjoint_weights``. Cannot be combined
+            with ``adjoints``.
+
+        - ``adjoint_weights`` : pandas.DataFrame or callable
+            Weights for ``weighted_adjoint``, laid out like the forward
+            output (report points x datatypes; absent cells weigh zero). A
+            callable is called as ``adjoint_weights(forward_df, member)``
+            after each forward run and returns such a frame, so weights may
+            depend on the simulated data. May also be set as an attribute.
 
         - ``output_format`` : {"list", "dict", "dataframe"}
             Output container type. Default ``"dataframe"``.
@@ -1136,13 +1227,25 @@ class JutulDarcy:
         )
 
         # ---- Adjoint configuration --------------------------------------- #
+        if "adjoints" in options and "weighted_adjoint" in options:
+            raise ValueError(
+                "'adjoints' and 'weighted_adjoint' are mutually exclusive"
+            )
+        self.adjoint_info: dict[str, AdjointObjective] = {}
+        self.weighted_parameters: list[str] | None = None
         if "adjoints" in options:
             self.compute_adjoints = True
             self.adjoint_info = _process_adjoint_info(options["adjoints"])
             self.eval_adjoint_funcs = options.get("eval_adjoint_funcs", False)
+        elif "weighted_adjoint" in options:
+            self.compute_adjoints = True
+            params = options["weighted_adjoint"]["parameters"]
+            self.weighted_parameters = [params] if isinstance(params, str) else list(params)
+            self.eval_adjoint_funcs = False
         else:
             self.compute_adjoints = False
             self.eval_adjoint_funcs = False
+        self.adjoint_weights = options.get("adjoint_weights")
         self.adjoint_funcs: pd.DataFrame | None = None
 
         # ---- Output / execution options ---------------------------------- #
@@ -1175,6 +1278,8 @@ class JutulDarcy:
                 f"Invalid adjoint_mode '{self.adjoint_mode}'. "
                 f"Must be one of {sorted(VALID_ADJOINT_MODES)}"
             )
+        if self.weighted_parameters is not None and self.adjoint_mode != "sensitivities":
+            raise ValueError("'weighted_adjoint' requires adjoint_mode 'sensitivities'")
         self.optimization_targets = options.get("optimization_targets")
 
         # ---- PET compatibility attributes -------------------------------- #
@@ -1182,6 +1287,7 @@ class JutulDarcy:
         # framework; we keep them as direct passthroughs.
         self.input_dict = options
         self.true_order = self.index
+        self.chain_rule = None  # the report of check_chain_rule, once it has run
 
     # ---------------------------------------------------------------- #
     # Public entry point
@@ -1205,6 +1311,10 @@ class JutulDarcy:
             Same shape as above, but each result is a ``(forward, adjoint)``
             tuple where ``adjoint`` is a :class:`pandas.DataFrame` with a
             ``(objective, parameter)`` MultiIndex on the columns.
+        Weighted-adjoint mode
+            As adjoint mode, but ``adjoint`` is a :class:`pandas.Series` of
+            full-grid gradients ``H^T w`` indexed by parameter, with the
+            weighted sum ``w^T d`` in ``adjoint.attrs["value"]``.
         """
         # Normalise to a list so the parallel path is uniform.
         if isinstance(inputs, (dict, str)):
@@ -1214,27 +1324,23 @@ class JutulDarcy:
         self._cleanup_simulation_folders()
 
         n = len(inputs)
-        outputs = p_map(
-            self.run_fwd_sim,
-            list(inputs),
-            list(range(n)),
-            num_cpus=self.parallel,
-            unit="sim",
-            desc="Simulations",
-            leave=False,
-            **PBAR_OPTS,
-        )
+        if n == 1:
+            return self.run_fwd_sim(inputs[0], 0)
+        if self.parallel == 1:
+            outputs = [self.run_fwd_sim(member, i) for i, member in enumerate(inputs)]
+        else:
+            # Forking after a previous run inherits a live Julia runtime and its threads.
+            with get_context("spawn").Pool(min(n, self.parallel)) as pool:
+                outputs = pool.starmap(self.run_fwd_sim, zip(inputs, range(n)))
 
         # In adjoint mode each worker returns a (result, adjoint) tuple; split
         # them out so callers see two parallel collections rather than a list
         # of tuples.
         if self.compute_adjoints:
             results, adjoints = zip(*outputs)
-            if n == 1:
-                return results[0], adjoints[0]
             return list(results), list(adjoints)
 
-        return outputs[0] if n == 1 else outputs
+        return outputs
 
     # ---------------------------------------------------------------- #
     # Per-member forward simulation
@@ -1261,50 +1367,232 @@ class JutulDarcy:
         -------
         Same as :meth:`__call__` for a single member.
         """
+        folder = Path(f"En_{idn}")
+        folder.mkdir(exist_ok=False)
+        try:
+            return self._simulate(input, idn, folder)
+        finally:
+            if delete_folder and folder.exists():
+                shutil.rmtree(folder, ignore_errors=True)
+
+    def run_vjp(self, state, weights):
+        """Return one PET-state gradient per weighted sum of METRIC well observations."""
+        self._check_vjp_state(state)
+        cells, seeds = scalar_seeds(weights, self.report, self.datatype)
+        if self.chain_rule is None or set(self.chain_rule["ties"]) != set(state):
+            self.check_chain_rule(state)
+        with TemporaryDirectory(prefix="vjp_", dir=".") as folder:
+            return self._simulate(dict(state), 0, Path(folder), (cells, seeds))
+
+    def _check_vjp_state(self, state):
+        if self.compute_adjoints or self.adjoint_mode != "sensitivities":
+            raise ValueError("Use sensitivities mode without ensemble 'adjoints' for PET VJPs")
+        valid = {"poro", "permx", "permy", "permz", "log_permx", "log_permy", "log_permz"}
+        if not state or set(state) - valid or not self.makofile:
+            raise ValueError("VJP needs a Mako deck with direct porosity or (log-)permeability fields")
+        if len({name.removeprefix("log_") for name in state}) != len(state):
+            raise ValueError("Only one PET variable may control a deck field")
+
+    # ---------------------------------------------------------------- #
+    # Does the derivative resolve every term of the chain rule?
+    # ---------------------------------------------------------------- #
+    def check_chain_rule(self, state, weights=None, step=1e-2, rtol=0.05, seed=0):
+        """Find everything in the case that moves with ``state``, and say whether ``run_vjp`` differentiates it.
+
+        Each state variable is perturbed, the deck rendered again and set up by JutulDarcy without simulating.
+        The rendered text may differ only inside the keyword of the variable's own field. Of the case, only
+        that field may move, the reservoir parameters JutulDarcy computes from it, the permeability axes the
+        wrapper adds for a deck ``COPY`` (``perm_copied``) and the well indices it differentiates
+        (``well_index_from_perm``). Anything else is a term the derivative lacks, and raises; so does a term
+        the wrapper adds for an axis or a well index that does not move.
+
+        With ``weights`` (as for ``run_vjp``) the gradients are also compared with central differences of the
+        weighted sums through template and simulator: the check of the whole chain, at four simulations per
+        variable and direction. A mismatch raises; the rows are in the returned report.
+        """
+        self._check_vjp_state(state)
+        from juliacall import Main as julia
+        julia.seval("using JutulDarcy, Jutul")
+        _ensure_julia_helpers(julia)
+        rng = np.random.default_rng(seed)
+        report = {"ties": {}, "derived": {}, "approximate": [], "unresolved": [], "finite_difference": []}
+        # What the wrapper adds is decided at the state itself, as run_vjp will decide it
+        base_text, base, wells, copied = self._set_up(state, julia)
+        for name, x in state.items():
+            x = np.asarray(x, dtype=float)
+            target = name.removeprefix("log_").upper()
+            sign = rng.choice([-1.0, 1.0], size=x.shape)
+            moved = x + 1e-3 * sign if name.startswith("log_") else x * (1 + 1e-3 * sign)
+            report["ties"][name] = ties = {}
+            try:
+                text, arrays, _, _ = self._set_up({**state, name: moved}, julia)
+            except ValueError as error:  # the deck does not hold the perturbed state itself
+                report["unresolved"].append(str(error))
+                continue
+            touched = keywords_changed(base_text, text)
+            if touched is None:
+                report["unresolved"].append(f"{name} changes the layout of the rendered deck")
+            else:
+                for keyword in sorted(touched - {target}):
+                    report["unresolved"].append(f"the template writes {keyword} from {name}")
+            changed = {key for key in base.keys() | arrays.keys() if key not in base or key not in arrays
+                       or base[key].shape != arrays[key].shape or not np.array_equal(base[key], arrays[key], equal_nan=True)}
+            field = "domain/Reservoir/" + ("porosity" if target == "PORO" else "permeability")
+            if field not in changed:
+                report["unresolved"].append(f"{name} does not reach the {field.rsplit('/', 1)[1]} of the case")
+                continue
+            axes = []  # the permeability axes whose sensitivities make up the gradient of this variable
+            if target != "PORO":
+                before, after = np.atleast_2d(base[field]), np.atleast_2d(arrays[field])
+                own = "XYZ".index(target[-1])
+                if own >= len(before):
+                    report["unresolved"].append(f"the case holds one permeability per cell, not {target}")
+                    continue
+                added = copied.include if copied is not None and name.endswith("permx") else np.arange(3) == own
+                axes = [axis for axis in range(len(before)) if added[axis]]
+                for axis in range(len(before)):
+                    if axis == own:
+                        continue
+                    other = "PERM" + "XYZ"[axis]
+                    if np.array_equal(before[axis], after[axis]):
+                        if added[axis]:
+                            report["unresolved"].append(
+                                f"the wrapper adds {other} to the gradient of {name}, which it does not follow (perm_copied)")
+                        continue
+                    factor = float(np.median(before[axis] / before[own]))
+                    if not all(np.allclose(k[axis], factor * k[own], rtol=1e-9, atol=0) for k in (before, after)):
+                        report["unresolved"].append(f"{other} follows {name}, but not by a constant factor")
+                    elif {other.lower(), "log_" + other.lower()} & set(state):
+                        report["unresolved"].append(f"{other} follows {name} and is a state variable of its own")
+                    elif not added[axis] or not np.isclose(copied.ratio[axis], factor, rtol=1e-6, atol=0):
+                        report["unresolved"].append(
+                            f"{other} follows {name} by the factor {factor:g}, which the wrapper does not add (perm_copied)")
+                    else:
+                        ties["xyz"[axis]] = factor
+            derived = set()
+            for key in sorted(changed - {field}):
+                section, model, quantity = key.split("/", 2)
+                if (section, model) == ("parameters", "Reservoir"):
+                    derived.add(quantity)  # JutulDarcy differentiates its reservoir parameters to the domain
+                elif axes and model != "Reservoir" and (section, quantity) in (
+                        ("domain", "permeability"), ("domain", "well_index"), ("parameters", "WellIndices")):
+                    continue  # the well indices are judged per connection below
+                else:
+                    report["unresolved"].append(f"{key} follows {name}")
+            for key in sorted(base if axes else ()):
+                section, well, quantity = key.split("/", 2)
+                if (section, quantity) != ("parameters", "WellIndices") or key not in arrays:
+                    continue
+                follows = base[key] != arrays[key]
+                differentiated = np.zeros(follows.shape, dtype=bool)
+                if well in wells:  # a term is added where the index depends on an axis of this variable
+                    differentiated[wells[well]["keep"]] = np.abs(wells[well]["dWI_dK"][axes]).sum(axis=0) > 0
+                for mask, message in (
+                        (follows & ~differentiated, "follows {name}, which the wrapper does not differentiate"),
+                        (differentiated & ~follows, "is differentiated by the wrapper, but does not follow {name}")):
+                    if mask.any():
+                        report["unresolved"].append(f"the well index of {int(mask.sum())} connection(s) of {well} "
+                                                    + message.format(name=name) + " (well_index_from_perm)")
+                if (follows & differentiated).any():
+                    derived.add("WellIndices")
+            report["derived"][name] = sorted(derived)
+        if report["unresolved"]:
+            raise ValueError("run_vjp would miss part of the chain rule: " + "; ".join(report["unresolved"]))
+        self.chain_rule = report
+        if weights is not None:
+            cells, seeds = scalar_seeds(weights, self.report, self.datatype)
+
+            def forward(x):
+                with TemporaryDirectory(prefix="audit_", dir=".") as folder:
+                    output = self._simulate({key: np.array(value, dtype=float) for key, value in x.items()}, 0, Path(folder))
+                return weighted_sums(pd.DataFrame(output, index=self.report), self.report, cells, seeds)
+
+            gradients = self.run_vjp({key: np.array(value, dtype=float) for key, value in state.items()}, weights)
+            report["finite_difference"] = finite_difference_check(forward, gradients, state, forward(state), step, rtol, seed)
+            failed = [row for row in report["finite_difference"] if row["ok"] is False]
+            if failed:
+                raise ValueError(f"Gradients differ from finite differences beyond {rtol:g}: {failed[:4]}")
+            if any(row["ok"] is None for row in report["finite_difference"]):
+                warnings.warn("The finite differences change too much with the step to judge some gradients: the "
+                              "simulated data are not smooth in the state. Tighten the solver tolerances or fix "
+                              "the time steps (rows with ok=None in the report).", stacklevel=2)
+        return report
+
+    def _set_up(self, state, julia):
+        """Render ``state`` and set the case up without simulating.
+
+        Returns the deck text, the arrays of the case by ``section/model/name``, and what the wrapper adds to
+        a permeability gradient: the well-index Jacobians and the copied axes.
+        """
+        state = {key: np.array(value, dtype=float) for key, value in state.items()}
+        with TemporaryDirectory(prefix="audit_", dir=".") as folder:
+            datafile = self._stage_input(dict(state), Path(folder), 0)
+            text = (Path(folder) / datafile).read_text()
+            with _chdir(folder):
+                case = self._setup_case(datafile, julia)
+            actnum = self._extract_actnum(case, julia)
+            self._validate_vjp_state(state, case, actnum, julia)
+            arrays = {str(key): np.array(value) for key, value in julia.subsurface_case_arrays(case).items()}
+            wells, _, copied = self._perm_gradient_context(case, actnum, list(state), julia)
+        return text, arrays, wells, copied
+
+    def _simulate(self, input, idn, folder, vjp=None):
         # Julia is imported lazily inside the worker so it picks up the
         # process-local thread/state. Importing at module scope would break
         # multiprocessing's fork/spawn semantics.
         from juliacall import Main as julia
-        julia.seval("using JutulDarcy, Jutul")
-        if self.compute_adjoints:
+        # Julia 1.11+ requires bindings to exist before PythonCall can assign them.
+        julia.seval("using JutulDarcy, Jutul; global case, res, grad_case, adj_packed, adj_storage, func")
+        if self.compute_adjoints or vjp is not None:
             _ensure_julia_helpers(julia)
 
-        folder = Path(f"En_{idn}")
-        folder.mkdir(exist_ok=False)
+        datafile = self._stage_input(input.copy() if isinstance(input, dict) else input, folder, idn)
+        with _chdir(folder):
+            case = self._setup_case(datafile, julia)
+            julia.case = case
+            units = self._detect_units(case, julia)
+            actnum_vec = self._extract_actnum(case, julia)
+            jlres = julia.simulate_reservoir(case, info_level=-1, output_substates=True)
+            julia.res = jlres
+            pyres = self.extract_datatypes(jlres, case, units, julia)
+            if vjp is not None or self.weighted_parameters is not None:
+                if isinstance(units, str) and units != "metric":
+                    raise ValueError("Weighted adjoints require a METRIC deck")
+                if vjp is not None:
+                    self._validate_vjp_state(input, case, actnum_vec, julia)
+                    return self._weighted_products(case, jlres, pyres, actnum_vec, julia,
+                                                   list(input), *vjp, state=input)
+                weights = self._resolve_adjoint_weights(pyres, idn)
+                r, c = np.nonzero(weights.to_numpy())
+                cells = list(zip(weights.index[r], weights.columns[c]))
+                seeds = weights.to_numpy()[r, c, None]
+                products = self._weighted_products(case, jlres, pyres, actnum_vec, julia,
+                                                   self.weighted_parameters, cells, seeds)
+                adjoint = pd.Series({p: g[0] for p, g in products.items()}, name="weighted_adjoint", dtype=object)
+                adjoint.attrs = {"value": float(seeds[:, 0] @ pyres.to_numpy()[r, c]), "units": "metric"}
+                return self._format_output(pyres), adjoint
+            output = self._format_output(pyres)
+            if self.compute_adjoints:
+                return output, self._compute_adjoints(case, jlres, pyres, units, actnum_vec, idn, julia)
+            return output
 
-        try:
-            # Stage the deck (render template or copy file).
-            datafile = self._stage_input(input, folder, idn)
+    @staticmethod
+    def _validate_vjp_state(state, case, actnum, jl):
+        """The deck must actually contain the PET coordinates being differentiated."""
+        active = actnum == 1
+        md = jl.seval("si_unit(:milli)*si_unit(:darcy)")
+        for name, x in state.items():
+            keyword = name.removeprefix("log_").upper()
+            field = np.asarray(case.input_data["GRID"][keyword]).ravel(order="F")[active]
+            if keyword != "PORO":
+                field = field / md
+            expected = np.exp(x) if name.startswith("log_") else np.asarray(x)
+            if expected.shape == active.shape:
+                expected = expected[active]
+            if (expected.shape != field.shape or not np.all(expected > 0)
+                    or not np.allclose(field, expected, rtol=3e-5, atol=0)):
+                raise ValueError(f"{name} must render directly in Cartesian order (check units and clipping)")
 
-            # All Julia file I/O must happen relative to the deck location.
-            with _chdir(folder):
-                case = self._setup_case(datafile, julia)
-                julia.case = case  # expose to Julia-side eval'd expressions
-
-                units = self._detect_units(case, julia)
-                actnum_vec = self._extract_actnum(case, julia)
-
-                # Forward solve. `output_substates=True` keeps intermediate
-                # states needed for adjoint reconstruction.
-                jlres = julia.simulate_reservoir(
-                    case, info_level=-1, output_substates=True
-                )
-                julia.res = jlres
-
-                pyres = self.extract_datatypes(jlres, case, units, julia)
-                output = self._format_output(pyres)
-
-                if self.compute_adjoints:
-                    adjoints = self._compute_adjoints(
-                        case, jlres, pyres, units, actnum_vec, idn, julia
-                    )
-                    return output, adjoints
-
-                return output
-        finally:
-            # Always clean up, even on failure, to keep the workspace tidy.
-            if delete_folder and folder.exists():
-                shutil.rmtree(folder, ignore_errors=True)
 
     # ---------------------------------------------------------------- #
     # Setup helpers
@@ -1371,12 +1659,13 @@ class JutulDarcy:
         Returns
         -------
         str
-            One of ``"metric"``, ``"si"``, ``"field"`` if specified.
+            One of ``"metric"``, ``"si"``, ``"field"``, ``"lab"`` if specified.
         Any
             ``julia.missing`` if no unit keyword is present.
         """
         runspec = case.input_data["RUNSPEC"]
-        for key, name in (("METRIC", "metric"), ("SI", "si"), ("FIELD", "field")):
+        for key, name in (("METRIC", "metric"), ("SI", "si"), ("FIELD", "field"),
+                          ("LAB", "lab")):
             if julia.haskey(runspec, key):
                 return name
         return julia.missing
@@ -1507,8 +1796,16 @@ class JutulDarcy:
         ValueError
             If a requested datatype or well is missing from the results.
         """
-        jl_units = julia.Symbol(units) if isinstance(units, str) else units
-        smry = julia.JutulDarcy.summary_result(jlcase, jlres, jl_units)
+        # Read surface quantities in SI: non-SI summaries in JutulDarcy 0.3.11
+        # accumulate per-day rates against seconds, including in LAB decks.
+        system = units if isinstance(units, str) else "metric"
+        keys = {key.split(":")[0] for key in self.datatype}
+        smry = julia.JutulDarcy.summary_result(jlcase, jlres, julia.Symbol(system if keys - SURFACE_KEYS else "si"))
+        surface = smry
+        if keys & SURFACE_KEYS:
+            deck = julia.JutulDarcy.GeoEnergyIO.InputParser.DeckUnitSystem(julia.Symbol(system))
+            if keys - SURFACE_KEYS and system != "si":
+                surface = julia.JutulDarcy.summary_result(jlcase, jlres, julia.Symbol("si"))
 
         # JutulDarcy builds its time vector as a floating-point cumulative sum
         # over adaptive ministeps (`output_substates=True` keeps every one of
@@ -1558,10 +1855,10 @@ class JutulDarcy:
         res: dict[str, np.ndarray] = {}
         attrs: dict[str, str] = {}
 
-        wells = smry["VALUES"]["WELLS"]
-        field = smry["VALUES"]["FIELD"]
-
         for datatype in self.datatype:
+            key = datatype.split(":")[0]
+            values = (surface if key in SURFACE_KEYS else smry)["VALUES"]
+            wells, field = values["WELLS"], values["FIELD"]
             if ":" in datatype:
                 # Well-level datatype: "<baseID>:<wellID>"
                 baseID, wellID = datatype.split(":")
@@ -1584,6 +1881,15 @@ class JutulDarcy:
                     )
                 res[datatype] = np.array(field[datatype])[idx]
                 attrs[datatype] = get_metric_unit(datatype)
+
+            if key in SURFACE_KEYS:
+                gas = key[1] == "G"
+                volume = deck.gas_volume_surface if gas else deck.liquid_volume_surface
+                rate = key.endswith("R")
+                res[datatype] *= (deck.time if rate else 1.0) / volume
+                unit = {"si": "m3", "metric": "Sm3", "field": "Mscf" if gas else "stb", "lab": "cm3"}[system]
+                period = {"si": "s", "metric": "day", "field": "day", "lab": "h"}[system]
+                attrs[datatype] = f"{unit}/{period}" if rate else unit
 
         df = pd.DataFrame(res, index=self.index[1])
         df.index.name = self.index[0]
@@ -1667,37 +1973,17 @@ class JutulDarcy:
 
         # dWI/dK depends only on the case, so it is built once and contracted
         # with each objective's dJ/dWI below.
-        needs_perm = any(
-            "perm" in param.lower()
-            for obj in self.adjoint_info.values()
-            for param in obj.parameters
+        wi_jacobian, ncells, perm_copy = self._perm_gradient_context(
+            case, actnum_vec,
+            [p for obj in self.adjoint_info.values() for p in obj.parameters],
+            julia,
         )
-        if needs_perm:
-            wi_jacobian, ncells = _well_index_perm_jacobian(
-                case, julia, self.well_index_from_perm
-            )
-            perm_copy = _detect_copied_perm_axes(
-                case, actnum_vec, self.perm_copied, julia
-            )
-        else:
-            wi_jacobian, ncells, perm_copy = {}, 0, None
 
         # Build the adjoint storage and the ministep expansion once per member.
         # `solve_adjoint_sensitivities` does both on every call, which is pure
         # repetition when a member has many objectives. `step_times` then lets
         # each objective stop its backward sweep at its own evaluation point.
-        step_times = None
-        if self.adjoint_mode == "sensitivities" and self.adjoint_reuse_storage:
-            julia.adj_packed = _suppress_julia(
-                julia, "subsurface_adjoint_packed(case, res)"
-            )
-            julia.adj_storage = _suppress_julia(
-                julia, "subsurface_adjoint_storage(case)"
-            )
-            step_times = np.asarray(
-                _suppress_julia(julia, "subsurface_packed_step_times(adj_packed)"),
-                dtype=float,
-            )
+        step_times = self._prepare_adjoint_storage(julia)
 
         pbar = self._make_adjoint_pbar(idn)
         sim_times = np.array(jlres.time) # Unit: seconds
@@ -1775,6 +2061,125 @@ class JutulDarcy:
             self.adjoint_funcs = fun
 
         return adjoints
+
+    def _weighted_products(self, case, res, summary, actnum, jl, parameters, cells, seeds, state=None):
+        """Differentiate the columns of labelled seeds on one live METRIC trajectory."""
+        active = actnum == 1
+        out = {p: np.zeros((seeds.shape[1], np.size(state[p]) if state is not None else len(actnum)))
+               for p in parameters}
+        if not np.isfinite(seeds).all():
+            raise ValueError("Weighted adjoint coefficients must be finite")
+        if not seeds.any():
+            return out
+        report_times = dict(zip(self.report, self.report_seconds))
+        times, wells, targets, rates, injectors, values = [], [], [], [], [], []
+        for label, key in cells:
+            kind, _, well = key.partition(":")
+            if not well or kind not in PHASE_MAP:
+                raise ValueError(f"No weighted adjoint for {key!r}; supported well data: {sorted(PHASE_MAP)}")
+            phase, rate = PHASE_MAP[kind]
+            times.append(report_times[label])
+            wells.append(well)
+            targets.append(RATE_ID_MAP[phase])
+            rates.append(rate)
+            injectors.append(kind[2] == "I")
+            values.append(summary.at[label, key])
+        step_times = self._prepare_adjoint_storage(jl)
+        if step_times is not None and any(np.count_nonzero(abs(step_times - t) <= STEP_TIME_TOL) != 1 for t in set(times)):
+            raise ValueError("Weighted adjoints require one matching simulator step per report time")
+        jac, nc, copied = self._perm_gradient_context(case, actnum, parameters, jl)
+        if state is not None and copied and any(p.endswith(axis) for axis, tied in zip(("permy", "permz"), copied.include[1:])
+                                                if tied for p in state):
+            raise ValueError("A copied axis cannot also be an independent permeability control")
+        for j, column in enumerate(seeds.T):
+            if not column.any():
+                continue
+            jl.func = jl.subsurface_weighted_well_objective(wells, targets, rates, injectors, times, column, STEP_TIME_TOL)
+            contributions = column * values
+            actual = float(jl.Jutul.evaluate_objective(jl.func, case, res.result))
+            if not np.isfinite(actual) or not np.isclose(actual, contributions.sum(), rtol=0, atol=1e-6 * np.abs(contributions).sum()):
+                raise ValueError("Weighted adjoint objective does not reproduce the reported data")
+            stop = max(t for t, w in zip(times, column) if w)
+            n_steps = None if step_times is None else int(np.searchsorted(step_times, stop + STEP_TIME_TOL, side="right"))
+            grad, well = self._solve_adjoint(jl, n_steps=n_steps)
+            wi = _well_index_chain_term(jac, well, nc, jl) if jac else None
+            for p in parameters:
+                g = _extract_adjoint(grad, case, p, actnum, copied if p.endswith("permx") else None, jl, wi_chain_term=wi)
+                if state is not None and np.size(state[p]) != len(g):
+                    g = g[active]
+                if g.shape != out[p][j].shape or not np.isfinite(g).all():
+                    raise ValueError(f"Invalid adjoint shape or nonfinite values for {p}")
+                out[p][j] = g
+        return out
+
+    def _resolve_adjoint_weights(self, pyres: pd.DataFrame, idn: int) -> pd.DataFrame:
+        """
+        Return this member's weights aligned with ``pyres``, zero where absent.
+
+        Raises
+        ------
+        ValueError
+            If no weights are configured, or they name report points or
+            datatypes the forward output does not have.
+        """
+        weights = self.adjoint_weights
+        if weights is None:
+            raise ValueError(
+                "'weighted_adjoint' needs 'adjoint_weights' (a DataFrame or a "
+                "callable returning one)"
+            )
+        if callable(weights):
+            weights = weights(pyres.copy(), idn)
+        weights = pd.DataFrame(weights)
+
+        extra_cols = [c for c in weights.columns if c not in pyres.columns]
+        extra_rows = [r for r in weights.index if r not in pyres.index]
+        if extra_cols or extra_rows:
+            raise ValueError(
+                f"Adjoint weights name data the simulation does not report: "
+                f"datatypes {extra_cols}, report points {extra_rows}"
+            )
+        weights = weights.reindex(index=pyres.index, columns=pyres.columns)
+        return weights.fillna(0.0).astype(np.float64)
+
+    def _perm_gradient_context(self, case, actnum_vec: np.ndarray,
+                               parameters: Iterable[str], julia):
+        """
+        Build what permeability gradients need beyond the adjoint solve itself.
+
+        Returns
+        -------
+        tuple
+            ``(wi_jacobian, ncells, perm_copy)`` for
+            :func:`_well_index_chain_term` and :func:`_extract_adjoint`; empty
+            when none of ``parameters`` is a permeability.
+        """
+        if not any("perm" in p.lower() for p in parameters):
+            return {}, 0, None
+        wi_jacobian, ncells = _well_index_perm_jacobian(
+            case, julia, self.well_index_from_perm
+        )
+        perm_copy = _detect_copied_perm_axes(case, actnum_vec, self.perm_copied, julia)
+        return wi_jacobian, ncells, perm_copy
+
+    def _prepare_adjoint_storage(self, julia) -> np.ndarray | None:
+        """
+        Bind ``adj_packed`` / ``adj_storage`` in Julia for reuse across solves.
+
+        Returns
+        -------
+        np.ndarray or None
+            End time in seconds of every ministep, or ``None`` when storage
+            reuse is off or does not apply to the adjoint mode.
+        """
+        if not (self.adjoint_mode == "sensitivities" and self.adjoint_reuse_storage):
+            return None
+        julia.adj_packed = _suppress_julia(julia, "subsurface_adjoint_packed(case, res)")
+        julia.adj_storage = _suppress_julia(julia, "subsurface_adjoint_storage(case)")
+        return np.asarray(
+            _suppress_julia(julia, "subsurface_packed_step_times(adj_packed)"),
+            dtype=float,
+        )
 
     def _solve_adjoint(self, julia, n_steps: int | None = None):
         """

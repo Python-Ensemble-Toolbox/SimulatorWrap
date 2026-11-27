@@ -1,5 +1,7 @@
 """PET's labelled seeds for scalar simulator summaries; columns are independent objectives."""
 
+import re
+
 import numpy as np
 
 
@@ -21,6 +23,20 @@ def scalar_seeds(weights, reports, datatypes):
     if not cells:
         raise ValueError("VJP needs at least one observed cell")
     return cells, np.stack(vectors)
+
+
+def keywords_changed(base_text, text):
+    """The deck keywords whose lines differ between two renderings of a template; ``None`` if the layout differs."""
+    base_lines, lines = base_text.splitlines(), text.splitlines()
+    if len(lines) != len(base_lines):
+        return None
+    keyword, changed = "", set()
+    for base_line, line in zip(base_lines, lines):
+        if re.fullmatch(r"[A-Z][A-Z0-9_]{1,7}", base_line.strip()):
+            keyword = base_line.strip()
+        if line != base_line:
+            changed.add(keyword)
+    return changed
 
 
 def weighted_sums(prediction, reports, cells, seeds):

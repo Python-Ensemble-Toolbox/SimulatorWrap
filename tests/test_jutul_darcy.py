@@ -11,6 +11,7 @@ from pathlib import Path
 import os
 import shutil
 import numpy as np
+import pandas as pd
 import pytest
 
 from subsurface.multphaseflow.jutul_darcy import JutulDarcy
@@ -408,3 +409,246 @@ def test_copy_detection_per_direction(
 
     np.testing.assert_array_equal(spec.include, expected_include)
     np.testing.assert_allclose(spec.ratio, expected_ratio, rtol=1e-9)
+
+
+# --------------------------------------------------------------------------- #
+# Weighted adjoint (H^T w)
+# --------------------------------------------------------------------------- #
+#: Rates, an injector rate and cumulatives, so every objective branch is used.
+WEIGHTED_DATA_TYPES = DATA_TYPES + ["WOPT:PRO2", "WWPT:PRO1"]
+
+#: Log-permeability amplitude of each Stein mode. Small enough that the
+#: response is close to cubic over the sample, where the control variate and
+#: antithetic pairs below leave little but gradient error.
+STEIN_AMPLITUDE = 0.02
+
+#: Antithetic pairs in the Stein ensemble (2 * pairs + 1 simulations).
+STEIN_PAIRS = 24
+
+#: Bound on |E[z f] - E[grad f]| relative to |E[grad f]|. The correct gradient
+#: sits at ~1.5%: adaptive timestepping makes the simulated f jump slightly
+#: where the ministep sequence changes, and Stein's lemma sees those jumps while
+#: the adjoint, which differentiates a fixed ministep sequence, cannot. Leaving
+#: out the well-index chain rule gives ~45%, ignoring PERMY/PERMZ ~145%.
+STEIN_RTOL = 0.05
+
+
+def _weighted_options(options: dict, weights, **extra) -> dict:
+    """Base options with the weighted adjoint w.r.t. log-permeability."""
+    return {
+        **options,
+        "datatype": WEIGHTED_DATA_TYPES,
+        "weighted_adjoint": {"parameters": ["log_permx"]},
+        "adjoint_weights": weights,
+        **extra,
+    }
+
+
+def _stein_basis() -> np.ndarray:
+    """
+    Smooth log-permeability modes on the 10 x 10 x 2 TINY grid, (n_cell, 4).
+
+    A uniform shift, an east-west trend, a bump around PRO2's perforations
+    (where the well-index chain rule acts) and a contrast between the layers
+    (which only the PERMZ part of the copied-permeability gradient sees).
+    """
+    i, j, k = np.meshgrid(np.arange(NX), np.arange(NY), np.arange(2), indexing="ij")
+    i, j, k = (a.flatten(order="F") for a in (i, j, k))
+    modes = np.stack([
+        np.ones(i.size),
+        np.cos(np.pi * i / (NX - 1)),
+        np.exp(-((i - 4) ** 2 + (j - 9) ** 2) / 4.0),
+        np.where(k == 0, 1.0, -1.0),
+    ], axis=1)
+    return STEIN_AMPLITUDE * modes
+
+
+class _MemberScaledWeights:
+    """Callable weights that are ``base * (member + 1)``, to see both arguments used."""
+
+    def __init__(self, base: pd.DataFrame):
+        self.base = base
+
+    def __call__(self, forward: pd.DataFrame, member: int) -> pd.DataFrame:
+        assert list(forward.columns) == WEIGHTED_DATA_TYPES
+        return self.base * (member + 1)
+
+
+@pytest.fixture(scope="module")
+def base_forward(tmp_path_factory, options, tiny_folder):
+    """Forward output of the unperturbed TINY case for the weighted datatypes."""
+    case_path = _copy_case_folder(
+        tmp_path_factory.mktemp("weighted_base"), tiny_folder, "TINY_BASE"
+    )
+    return _run_case(case_path, {**options, "datatype": WEIGHTED_DATA_TYPES})
+
+
+@pytest.fixture(scope="module")
+def random_weights(base_forward) -> pd.DataFrame:
+    """Signed weights with every datatype contributing on a comparable scale."""
+    rng = np.random.default_rng(7)
+    raw = pd.DataFrame(rng.standard_normal(base_forward.shape),
+                       index=base_forward.index, columns=base_forward.columns)
+    return raw / base_forward.abs().mean()
+
+
+def test_surface_units_against_si_on_the_same_trajectory(tmp_path, options, tiny_folder, monkeypatch):
+    case_dir = _copy_case_folder(tmp_path, tiny_folder, "units")
+    monkeypatch.chdir(case_dir)
+    keys = ["WOPT:PRO2", "WWIT:INJ1", "FLPT", "FGPT", "WOPR:PRO2"]
+    sim = JutulDarcy({**options, "datatype": keys})
+    extract = sim.extract_datatypes
+
+    def check(result, case, units, jl):
+        summary = jl.JutulDarcy.summary_result(case, result, jl.Symbol("si"))
+        si = summary["VALUES"]
+        times = np.rint(np.array(summary["TIME"].seconds)).astype(int)
+        report = [np.flatnonzero(times == (date - datetime(2022, 1, 1)).total_seconds()).item()
+                  for date in REPORT_DATES]
+        expected = np.column_stack([np.array(si["WELLS"][well][key] if well else si["FIELD"][key])
+                                    for key, _, well in (k.partition(":") for k in keys)])[report]
+        assert (expected[-1] > 0).all()
+        for system, liquid, gas, period in [("si", 1, 1, 1), ("metric", 1, 1, 86400),
+                                            ("lab", 1e-6, 1e-6, 3600),
+                                            ("field", 0.158987294928, 28.316846592, 86400)]:
+            frame = extract(result, case, system, jl)
+            np.testing.assert_allclose(frame.to_numpy(), expected / [liquid, liquid, liquid, gas, liquid / period],
+                                       rtol=1e-6)
+        return frame
+
+    monkeypatch.setattr(sim, "extract_datatypes", check)
+    sim.run_fwd_sim({"log_permx": np.log(np.load("PERMX.npy"))})
+
+
+def test_weighted_adjoint_matches_weighted_sum_of_sensitivities(
+    tmp_path, options, tiny_folder, random_weights
+):
+    """One weighted solve equals sum_i w_i * grad d_i from one solve per datum."""
+    case_path = _copy_case_folder(tmp_path, tiny_folder, "TINY_WEIGHTED")
+    _, weighted = _run_case(case_path, _weighted_options(options, random_weights))
+
+    adjoints: dict[str, dict] = {}
+    for datatype in WEIGHTED_DATA_TYPES:
+        base, well = datatype.split(":")
+        spec = adjoints.setdefault(
+            base, {"wellID": [], "steps": "all", "parameters": ["log_permx"]}
+        )
+        spec["wellID"].append(well)
+    _, per_datum = _run_case(case_path, {
+        **options, "datatype": WEIGHTED_DATA_TYPES, "adjoints": adjoints,
+    })
+
+    expected = sum(
+        random_weights.loc[t, d] * per_datum.loc[t, (d, "log_permx")]
+        for t in random_weights.index
+        for d in WEIGHTED_DATA_TYPES
+    )
+    # Jutul's adjoint linear solver is iterative, so the two paths agree to
+    # its tolerance rather than to rounding.
+    np.testing.assert_allclose(weighted["log_permx"], expected,
+                               rtol=1e-3, atol=1e-3 * np.abs(expected).max())
+
+
+def test_weighted_adjoint_is_linear_in_callable_weights(
+    tmp_path, options, tiny_folder, random_weights
+):
+    """A callable gets each member's index, and H^T w scales with w."""
+    case_path = _copy_case_folder(tmp_path, tiny_folder, "TINY_CALLABLE")
+    log_permx = np.log(np.load(case_path / "PERMX.npy"))
+    simulator = JutulDarcy(_weighted_options(
+        options, _MemberScaledWeights(random_weights), parallel=2
+    ))
+    with _working_directory(case_path):
+        _, (first, second) = simulator(
+            [{"log_permx": log_permx.copy()}, {"log_permx": log_permx.copy()}]
+        )
+
+    assert second.attrs["value"] == pytest.approx(2 * first.attrs["value"])
+    np.testing.assert_allclose(second["log_permx"], 2 * first["log_permx"],
+                               rtol=1e-3, atol=1e-3 * np.abs(first["log_permx"]).max())
+
+
+def test_weighted_adjoint_satisfies_steins_lemma(
+    tmp_path, options, tiny_folder, random_weights
+):
+    """
+    Stein's lemma: for ``z ~ N(0, I)`` and ``f(z) = L(x0 + B z)``,
+    ``E[z f(z)] = E[grad_z f(z)] = E[B^T grad_x L]``. The left side needs only
+    forward values, the right side only adjoint gradients, so their agreement
+    checks the gradient without finite differences and without assuming f is
+    linear over the sample.
+
+    Two exact variance reductions make a small ensemble enough: antithetic
+    pairs ``+-z`` (the even part of f and the odd part of its gradient cancel),
+    and the control variate ``z^T a0`` with ``a0 = B^T grad L(x0)``, which
+    removes the same mean from both sides because ``E[z z^T a0] = a0``.
+    """
+    case_path = _copy_case_folder(tmp_path, tiny_folder, "TINY_STEIN")
+    x0 = np.log(np.load(case_path / "PERMX.npy"))
+    basis = _stein_basis()
+    half = np.random.default_rng(42).standard_normal((STEIN_PAIRS, basis.shape[1]))
+    z = np.vstack([half, -half])
+    members = x0 + z @ basis.T
+    # The template caps log-permeability at 6, beyond which the gradient
+    # would describe a field the deck never sees.
+    assert members.max() < 6.0
+
+    simulator = JutulDarcy(_weighted_options(
+        options, random_weights, parallel=min(4, os.cpu_count() or 1)
+    ))
+    with _working_directory(case_path):
+        _, gradients = simulator(
+            [{"log_permx": x0.copy()}] + [{"log_permx": x} for x in members]
+        )
+
+    f = np.array([g.attrs["value"] for g in gradients])
+    grad_z = np.array([basis.T @ g["log_permx"] for g in gradients])
+    f0, a0 = f[0], grad_z[0]
+    n = STEIN_PAIRS
+    f_odd = (f[1:n + 1] - f[n + 1:]) / 2
+    grad_even = (grad_z[1:n + 1] + grad_z[n + 1:]) / 2
+
+    # Per pair: z (f_odd - z^T a0) - (grad_even - a0), whose mean is zero.
+    residual = half * (f_odd - half @ a0)[:, None] - (grad_even - a0)
+    mean = residual.mean(axis=0)
+    std_err = residual.std(axis=0, ddof=1) / np.sqrt(n)
+    scale = np.linalg.norm(grad_z[1:].mean(axis=0))
+
+    assert np.linalg.norm(std_err) < 0.02 * scale, (
+        "Stein estimate too noisy to judge the gradient"
+    )
+    assert np.linalg.norm(mean) < STEIN_RTOL * scale, (
+        f"E[z f] - E[grad f] = {mean} (std. err. {std_err}) against "
+        f"|E[grad f]| = {scale:.4g}"
+    )
+
+
+def test_weighted_adjoint_rejects_weights_for_unreported_data(options, random_weights):
+    """Weights naming a datatype or report point the run lacks are an error."""
+    simulator = JutulDarcy(_weighted_options(options, random_weights))
+    forward = random_weights * 0.0
+    simulator.adjoint_weights = random_weights.assign(**{"WOPR:NOPE": 1.0})
+    with pytest.raises(ValueError, match="WOPR:NOPE"):
+        simulator._resolve_adjoint_weights(forward, 0)
+
+    simulator.adjoint_weights = random_weights.iloc[:2].copy()
+    simulator.adjoint_weights.index = [datetime(1999, 1, 1), REPORT_DATES[1]]
+    with pytest.raises(ValueError, match="1999"):
+        simulator._resolve_adjoint_weights(forward, 0)
+
+    simulator.adjoint_weights = random_weights[["WOPR:PRO1"]]
+    resolved = simulator._resolve_adjoint_weights(forward, 0)
+    assert list(resolved.columns) == WEIGHTED_DATA_TYPES
+    assert (resolved.drop(columns="WOPR:PRO1") == 0.0).all().all()
+
+
+def test_weighted_adjoint_option_validation(options):
+    """Only one adjoint flavour at a time, and only on the sensitivities path."""
+    weighted = {"parameters": ["log_permx"]}
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        JutulDarcy({**options, "weighted_adjoint": weighted,
+                    "adjoints": {"WOPR": {"wellID": "PRO1", "steps": "all",
+                                          "parameters": ["permx"]}}})
+    with pytest.raises(ValueError, match="sensitivities"):
+        JutulDarcy({**options, "weighted_adjoint": weighted,
+                    "adjoint_mode": "optimization"})

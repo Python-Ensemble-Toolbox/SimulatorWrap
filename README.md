@@ -8,6 +8,69 @@ Clone the repository and install it in editable mode by running
 python3 -m pip install -e .
 ```
 
+## JutulDarcy weighted adjoints for PET (LowRankGN and SVGD)
+
+Pass the existing `subsurface.multphaseflow.jutul_darcy.JutulDarcy(options)`
+to PET. Use a Mako `runfile`, `adjoint_mode="sensitivities"` (the default),
+and omit `adjoints`. Ordinary forecasts then return just predictions. The
+existing `adjoints` configuration remains available for standalone
+per-observation gradients.
+
+`run_vjp(state, weights)` accepts PET's report-by-datatype frame. An
+observed cell contains the k coefficients of that datum, a missing cell
+is `None`. It runs the centre once per call, shares its ministeps and
+adjoint storage across the columns, and returns `{name: array(k, n)}` in
+the coordinates of each state field. There is no cross-call cache. The
+wrapper checks each weighted objective against the direct forward summary.
+
+For SVGD, set `weighted_adjoint={"parameters": ["log_permx"]}` instead.
+PET sets `sim.adjoint_weights` to a callable `(forward_frame, member_index)`
+returning one scalar weight per observed cell (missing weights are zero).
+`run_fwd_sim` returns `(output, gradient_series)` from that member's live
+trajectory, with no second forward solve. Match the gradient coordinate
+to the state: `permx` differentiates mD, `log_permx` its natural logarithm.
+
+Both entry points support METRIC well observations on report steps: `WOPR`,
+`WWPR`, `WGPR`, `WLPR`, `WWIR` (Sm³/day) and `WOPT`, `WWPT`, `WGPT`,
+`WLPT` (Sm³). The batched VJP's supported controls are
+direct `poro` (fraction), `permx`, `permy`, `permz` (mD) and `log_permx`
+etc. (natural log of mD). Use Cartesian deck order, full grid or processed
+active cells. The permeability gradient includes the wrapper's existing
+well-index and copied-axis chain rules. Specify `perm_copied=False` for
+independent axes or `True` for three identical copies when the deck fields
+alone are ambiguous. Inputs must render directly: clipping outside bounds,
+fault factors, and other template dependencies need their own chain rule.
+
+`check_chain_rule(state, weights=None)` tells whether the derivative resolves
+every term of the chain rule from the state to the weighted sums. It perturbs
+each variable, renders the deck again and lets JutulDarcy set the case up
+without simulating, then compares the rendered text and the arrays of the two
+cases: data domains, parameters and initial state of every model. Only the
+variable's own field may move, the reservoir parameters JutulDarcy computes
+from it, the axes `perm_copied` adds and the well indices
+`well_index_from_perm` differentiates. `run_vjp` runs this part itself before
+its first batch. It raises on a term it would miss, and on a term the options
+add for an axis or a well index that does not move; this settles the cases the
+detection from the deck fields cannot, such as a uniform `PERMX`. The returned
+report lists the tied axes (`ties`) and the derived parameters (`derived`).
+
+With `weights`, the gradients are also compared with central differences of
+the weighted sums along an alternating and a uniform direction, at two step
+sizes: four simulations per variable and direction. A mismatch raises. A row
+with `ok = None` could not be judged because the finite differences change
+too much with the step.
+
+**Forward summary unit change:** field and well surface totals (including
+`WWIT` and `FLPT`) are now converted from SI volumes. Previously JutulDarcy
+0.3.11's METRIC/FIELD cumulative outputs were 86,400 times too large. Rates
+are reported per day for METRIC/FIELD, per hour for LAB, and per second for
+SI. Do not rescale PET observations or gradients to compensate for the old
+output. Recheck any prior workaround before comparing stored forecasts.
+
+With the wrapper's Julia environment active, run `python -m pytest -q
+tests/test_jutul_darcy.py tests/test_jutul_vjp.py` for both derivative
+paths, the directional finite difference and the SI-volume regression.
+
 ## Examples
 ### PET LowRankGN: weighted Flow adjoints
 

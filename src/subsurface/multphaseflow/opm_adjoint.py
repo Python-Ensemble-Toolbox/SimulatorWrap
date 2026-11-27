@@ -15,7 +15,7 @@ from resdata.summary import Summary
 from resdata.resfile import ResdataFile
 
 from .opm import flow
-from .vjp import finite_difference_check, scalar_seeds, weighted_sums
+from .vjp import finite_difference_check, keywords_changed, scalar_seeds, weighted_sums
 
 PHASES = {"WOPR": "oil", "WWPR": "water", "WGPR": "gas"}
 FIELDS = {"poro", "permx", "permy", "permz", "log_permx", "log_permy", "log_permz"}
@@ -221,12 +221,10 @@ class FlowAdjoint(flow):
             sign = rng.choice([-1.0, 1.0], size=x.shape)
             moved = x + 1e-3 * sign if name.startswith("log_") else x * (1 + 1e-3 * sign)
             text, arrays, cells, _ = self._dry_run({**state, name: moved})
-            lines, base_lines = text.splitlines(), base_text.splitlines()
-            if len(lines) != len(base_lines):
+            touched = keywords_changed(base_text, text)
+            if touched is None:
                 report["unresolved"].append(f"{name} changes the layout of the rendered deck")
             else:
-                keywords = _keyword_of_lines(base_lines)
-                touched = {keywords[i] for i, (a, b) in enumerate(zip(lines, base_lines)) if a != b}
                 for keyword in sorted(touched - {target}):
                     report["unresolved"].append(f"the template writes {keyword} from {name}")
             changed = {key for key in base if key not in arrays or not np.array_equal(arrays[key], base[key])}
@@ -297,16 +295,6 @@ class FlowAdjoint(flow):
             with closing(ResdataFile(str(folder / (self.file + ".EGRID")))) as grid:
                 cells = np.asarray(grid["ACTNUM"][0]) != 0 if grid.has_kw("ACTNUM") else slice(None)
             return deck.read_text(), arrays, cells, _connection_factors_from_permeability(deck)
-
-
-def _keyword_of_lines(lines):
-    """The deck keyword each line belongs to."""
-    current, out = "", []
-    for line in lines:
-        if re.fullmatch(r"[A-Z][A-Z0-9_]{1,7}", line.strip()):
-            current = line.strip()
-        out.append(current)
-    return out
 
 
 def _connection_factors_from_permeability(deck):
