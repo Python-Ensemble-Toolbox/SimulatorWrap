@@ -9,6 +9,83 @@ python3 -m pip install -e .
 ```
 
 ## Examples
+### PET LowRankGN: weighted Flow adjoints
+
+Use `subsurface.multphaseflow.opm_adjoint.FlowAdjoint(options)` in place of
+`flow(options)`. Give it the usual Flow options plus `adjoint_executable` (an
+absolute executable path or command on PATH; default `flow_adjoint`), the
+executable of [OPM/opm-adjoint](https://github.com/OPM/opm-adjoint) built
+against the official OPM modules. Stock `flow` has no adjoint. No Python
+dependency is added.
+
+After `setup_fwd_run()`, `run_vjp(state, weights)` renders the centre once,
+records a trajectory, and replays it serially for each nonzero seed column.
+`weights` is PET's report-by-datatype frame: each observed cell holds a
+length-k vector; `None` cells are skipped. Each returned `grad[name][j]` is
+the derivative of the j-th weighted summary with respect to `state[name]`.
+Forward members never record an archive. The temporary archive needs enough
+disk for all substeps and is removed after the batch.
+
+The weighted sums are handed to `flow_adjoint` as a JSON objective
+(`--adjoint-config`): one `rate` term per observed value, active on the
+substep that ends on its report. Gradients are read from the
+`ADJOINT_GRADIENTS_{PORO,PERM}.csv` files and their JSON sidecar. Each batch
+adds one objective-only replay, which fixes the substep lengths the terms
+need.
+
+- Use scalar `WOPR`, `WWPR` or `WGPR` for **producing wells** in Sm³/day. A
+  report may be any time a simulator step ends on; the wrapper checks the
+  objective against the recorded summary, which must hold every simulator
+  step: `RPTONLY` in the deck is switched off for the recorded run.
+- Use serial METRIC decks writing `INIT`, with independent `poro` (fraction),
+  `permx`, `permy`, `permz` (mD), or `log_permx` etc. (natural log of mD), one
+  value per active cell or per grid cell in natural order. The gradient has
+  the shape of the state; inactive cells get zero. A permeability axis the
+  deck ties to the variable's field by a constant factor (`COPY`, `MULTIPLY`)
+  is found and added to its gradient. Anything else that moves with the
+  state is refused: another keyword the template writes from it, a clipped
+  or otherwise transformed field, an array Flow derives from it that
+  opm-adjoint does not differentiate.
+- Connection factors computed from the permeability and multisegment wells
+  are differentiated by opm-adjoint. Two cases need changes that are not in
+  its master yet:
+  [OPM/opm-adjoint#2](https://github.com/OPM/opm-adjoint/pull/2) for exact
+  gradients with producers on RESV control, and
+  [OPM/opm-adjoint#3](https://github.com/OPM/opm-adjoint/pull/3) for wells
+  that the schedule defines after the first report step.
+- The same executable and solver flags drive both predictions and adjoints.
+  opm-adjoint's own solver flags, such as `--adjoint-linear-solver=umfpack`,
+  go in `sim_flag` with the others; the wrapper sets the archive, mode,
+  objective and output flags itself and refuses them there.
+  Use converged forward tolerances and check a directional derivative when
+  moving to a new deck (below); matching objective values checks units and
+  timing, not the accuracy of the backend derivative.
+
+`check_chain_rule(state, weights=None)` tells whether the derivative resolves
+every term of the chain rule from the state to the weighted sums. It perturbs
+each variable, renders the deck again and lets Flow read it without
+simulating, then compares the rendered text and Flow's `INIT` arrays with the
+unperturbed ones. `run_vjp` runs this part itself before its first batch, and
+raises on a term it would miss. The returned report lists the tied axes
+(`ties`), the arrays Flow derives (`derived`) and what opm-adjoint
+differentiates approximately (`approximate`: connection factors left for Flow
+to compute from the permeability, of which it keeps the Kh term).
+
+With `weights`, the gradients are also compared with central differences of
+the weighted sums along an alternating and a uniform direction, at two step
+sizes: four simulations per variable and direction. This is the check that
+reaches dependencies inside Flow which its `INIT` arrays do not show. A
+mismatch raises. A row with `ok = None` could not be judged because the
+finite differences change too much with the step: the simulated rates are
+not smooth in the state, which adaptive time stepping and loose solver
+tolerances cause; fixed steps and tight tolerances make it conclusive.
+
+Run the directional derivative tests with `FLOW_ADJOINT` pointing to the
+executable and `OPM_ADJOINT_CASE` to `doc/tutorials/MODEL_1D_DEBUG` of
+opm-adjoint: `python -m pytest -q tests/test_flow_vjp.py` (with PET on the
+Python path).
+
+### Forward Flow example
 The example demonstrates usage of [OPM-flow](https://opm-project.org/). To reproduce, ensure that OPM-flow is installed and in the path. The full noteboox is [here](https://github.com/Python-Ensemble-Toolbox/SimulatorWrap/tree/main/Example), we employ the [3Spot example](https://github.com/Python-Ensemble-Toolbox/Examples/tree/main/3Spot) as a template for this example. All files are Example folder.
 
 
